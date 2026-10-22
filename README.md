@@ -18,6 +18,27 @@
 
 ## Установка
 
+### Быстрая установка (скриптом)
+
+С Windows (нужен SSH-доступ к роутеру):
+
+```powershell
+# ключ по умолчанию: %USERPROFILE%\.ssh\id_ed25519
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -HostName 192.168.1.1 -User root -WithLyrebird
+```
+
+Скрипт копирует проект на роутер, ставит зависимости (`tor`, `curl`,
+`nftables`, `conntrack`), устанавливает приложение, выполняет миграцию и
+включает сервисы `tor` и `tor-ext`.
+
+На самом роутере:
+
+```sh
+sh install-router.sh /путь/к/luci-app-tor-ext   # зависимости + приложение
+sh install-lyrebird.sh                           # транспорты obfs4/snowflake/meek/webtunnel
+```
+
 ### Готовый пакет
 
 Скачать: [luci-app-tor-ext-1.0.0-r1.apk](https://github.com/jeysson89/luci-app-tor-ext/releases/download/v1.0.0/luci-app-tor-ext-1.0.0-r1.apk)
