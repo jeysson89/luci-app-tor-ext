@@ -20,7 +20,10 @@
 
 ### Готовый пакет
 
+Скачать: [luci-app-tor-ext-1.0.0-r1.apk](https://github.com/jeysson89/luci-app-tor-ext/releases/download/v1.0.0/luci-app-tor-ext-1.0.0-r1.apk)
+
 ```sh
+scp luci-app-tor-ext-1.0.0-r1.apk root@<роутер>:/tmp/
 apk add --allow-untrusted /tmp/luci-app-tor-ext-1.0.0-r1.apk
 ```
 
