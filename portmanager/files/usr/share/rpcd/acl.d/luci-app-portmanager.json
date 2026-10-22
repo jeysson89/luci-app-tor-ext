@@ -1,0 +1,19 @@
+{
+	"luci-app-portmanager": {
+		"description": "Grant access to the LAN/WAN port management application",
+		"read": {
+			"ubus": {
+				"portmanager": [
+					"list"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"portmanager": [
+					"setEnabled"
+				]
+			}
+		}
+	}
+}

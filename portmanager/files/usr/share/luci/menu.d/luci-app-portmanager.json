@@ -1,0 +1,15 @@
+{
+	"admin/network/portmanager": {
+		"title": "Управление портами",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "portmanager/main"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-portmanager"
+			]
+		}
+	}
+}

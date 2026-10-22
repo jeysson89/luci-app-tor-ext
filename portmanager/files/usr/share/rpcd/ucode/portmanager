@@ -1,0 +1,607 @@
+'use strict';
+/*
+ * luci-app-portmanager - backend (rpcd/ucode plugin)
+ *
+ * Возможности:
+ *   - список портов (Ethernet и Wi-Fi AP) с состоянием, скоростью и MAC;
+ *   - MAC-адреса клиентов по каждому порту (bridge FDB + ARP + DHCP-аренды);
+ *   - включение/отключение порта:
+ *       Ethernet - через netifd ("option enabled" в секции config device);
+ *       Wi-Fi     - через "option disabled" в секции wifi-iface.
+ */
+
+import { cursor } from 'uci';
+import { popen, readfile, stat, lsdir } from 'fs';
+
+const SYSNET = '/sys/class/net';
+
+/* ------------------------------------------------------------------ */
+/* утилиты                                                              */
+/* ------------------------------------------------------------------ */
+
+function sh(cmd)
+{
+	let p = popen(cmd);
+	if (!p)
+		return '';
+	let out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function sysRead(path)
+{
+	let v = readfile(path);
+	return v == null ? '' : trim(v);
+}
+
+function exists(path)
+{
+	return stat(path) != null;
+}
+
+function isMulticast(mac)
+{
+	return substr(mac, 0, 8) == '33:33:00'
+	    || substr(mac, 0, 8) == '01:00:5e'
+	    || substr(mac, 0, 8) == 'ff:ff:ff';
+}
+
+function isMac(mac)
+{
+	return match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) != null;
+}
+
+/* ------------------------------------------------------------------ */
+/* состояние портов                                                     */
+/* ------------------------------------------------------------------ */
+
+/* разбор "ip -o link show": флаги, mtu, master, состояние, MAC */
+function linkInfo()
+{
+	const res = {};
+	const lines = split(sh('ip -o link show 2>/dev/null'), '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		let m = match(trim(lines[i]),
+			/^([0-9]+):[ \t]+([^:@]+)(@[^ \t]+)?:[ \t]+<([^>]*)>[ \t]+mtu[ \t]+([0-9]+)(.*)$/);
+		if (!m)
+			continue;
+
+		const flags = split(m[4], ',');
+		const info = {
+			name:     m[2],
+			admin_up: index(flags, 'UP') > -1,
+			lower_up: index(flags, 'LOWER_UP') > -1,
+			mtu:      +m[5],
+			master:   '',
+			state:    '',
+			mac:      '',
+		};
+
+		const rest = m[6];
+		let mm = match(rest, /master[ \t]+([^ \t]+)/);
+		if (mm)
+			info.master = mm[1];
+		mm = match(rest, /state[ \t]+([^ \t]+)/);
+		if (mm)
+			info.state = mm[1];
+		mm = match(rest, /link\/[a-z]+[ \t]+([0-9a-fA-F:]+)/);
+		if (mm)
+			info.mac = lc(mm[1]);
+
+		res[info.name] = info;
+	}
+
+	return res;
+}
+
+/* секции "config device" из /etc/config/network */
+function networkDevices()
+{
+	const u = cursor();
+	const res = {};
+
+	u.foreach('network', 'device', function(s) {
+		let nm = s.name;
+		if (nm == null || nm == '')
+			nm = s['.name'];
+		if (nm == null || nm == '')
+			return;
+
+		res[nm] = {
+			section: s['.name'],
+			enabled: !(s.enabled == '0'),
+		};
+	});
+
+	return res;
+}
+
+/* имя интерфейса (lan/wan/...) для устройства */
+function networkInterfaces()
+{
+	const u = cursor();
+	const res = {};
+
+	u.foreach('network', 'interface', function(s) {
+		let dev = s.device;
+		if (dev == null || dev == '')
+			dev = s.ifname;
+		if (dev == null || dev == '')
+			return;
+
+		res[dev] = s['.name'];
+	});
+
+	return res;
+}
+
+/* соответствие AP-интерфейса (phy0-ap0) и секции wifi-iface */
+function wirelessStatus()
+{
+	const res = {};
+	const raw = sh('ubus call network.wireless status 2>/dev/null');
+
+	if (!length(trim(raw)))
+		return res;
+
+	let data = null;
+	try {
+		data = json(raw);
+	}
+	catch (e) {
+		data = null;
+	}
+	if (data == null)
+		return res;
+
+	for (let radio, r in data) {
+		const ifaces = r.interfaces ?? [];
+		for (let i = 0; i < length(ifaces); i++) {
+			const ifn = ifaces[i].ifname ?? '';
+			if (!length(ifn))
+				continue;
+
+			res[ifn] = {
+				section: ifaces[i].section ?? '',
+				ssid:    ifaces[i].config?.ssid ?? '',
+				mode:    ifaces[i].config?.mode ?? '',
+				radio:   radio,
+			};
+		}
+	}
+
+	return res;
+}
+
+/* секция wifi-device -> имя физического phy ("phy0", "phy1", ...) */
+function wirelessRadios()
+{
+	const u = cursor();
+	const devs = [];
+
+	u.foreach('wireless', 'wifi-device', function(s) {
+		const p = s.path ?? '';
+		let m = match(p, /^(.*)\+([0-9]+)$/);
+
+		push(devs, {
+			section: s['.name'],
+			base:    (m ? m[1] : p),
+			idx:     (m ? +m[2] : null),
+		});
+	});
+
+	const counter = {};
+	const res = {};
+
+	for (let i = 0; i < length(devs); i++) {
+		const d = devs[i];
+
+		if (d.idx == null) {
+			const n = counter[d.base] ?? 0;
+			counter[d.base] = n + 1;
+			d.idx = n;
+		}
+
+		res[d.section] = 'phy' + d.idx;
+	}
+
+	return res;
+}
+
+/*
+ * Wi-Fi порты берём из конфигурации, а не из списка интерфейсов ядра:
+ * выключенная точка доступа вообще не появляется в /sys/class/net,
+ * но её всё равно нужно показывать и иметь возможность включить обратно.
+ */
+function wirelessPorts()
+{
+	const u = cursor();
+	const sections = [];
+
+	u.foreach('wireless', 'wifi-iface', function(s) {
+		push(sections, {
+			section:  s['.name'],
+			device:   s.device ?? '',
+			mode:     s.mode ?? '',
+			ssid:     s.ssid ?? '',
+			network:  s.network ?? '',
+			disabled: (s.disabled == '1'),
+		});
+	});
+
+	const radios = wirelessRadios();
+	const status = wirelessStatus();
+	const bySection = {};
+
+	for (let ifn, w in status)
+		bySection[w.section] = ifn;
+
+	const apIndex = {};
+	const out = [];
+
+	for (let i = 0; i < length(sections); i++) {
+		const s = sections[i];
+
+		if (s.mode != 'ap')
+			continue;
+
+		const phy = radios[s.device] ?? '';
+		if (!length(phy))
+			continue;
+
+		const n = apIndex[phy] ?? 0;
+		apIndex[phy] = n + 1;
+
+		let ifname = bySection[s.section];
+		if (!length(ifname))
+			ifname = `${phy}-ap${n}`;
+
+		push(out, {
+			name:     ifname,
+			section:  s.section,
+			ssid:     s.ssid,
+			network:  s.network,
+			disabled: s.disabled,
+		});
+	}
+
+	return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* клиенты (MAC-адреса)                                                 */
+/* ------------------------------------------------------------------ */
+
+/* таблица пересылки моста: MAC -> физический порт */
+function fdbEntries()
+{
+	const res = {};
+	const raw = sh('bridge fdb show 2>/dev/null');
+
+	if (!length(trim(raw)))
+		return res;
+
+	const lines = split(raw, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const line = trim(lines[i]);
+		if (!length(line))
+			continue;
+		if (index(line, 'permanent') > -1)
+			continue;
+		if (index(line, 'self') > -1)
+			continue;
+
+		let m = match(line, /^([0-9a-fA-F:]+)[ \t]+dev[ \t]+([^ \t]+)/);
+		if (!m)
+			continue;
+
+		const mac = lc(m[1]);
+		if (!isMac(mac) || isMulticast(mac))
+			continue;
+
+		res[mac] = m[2];
+	}
+
+	return res;
+}
+
+/* ARP: MAC -> { ip, dev } */
+function arpEntries()
+{
+	const res = {};
+	const lines = split(sh('cat /proc/net/arp 2>/dev/null'), '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		const line = trim(lines[i]);
+		if (!length(line))
+			continue;
+
+		const parts = split(line, /[ \t]+/);
+		if (length(parts) < 6 || parts[0] == 'IP')
+			continue;
+
+		const mac = lc(parts[3]);
+		if (!isMac(mac) || isMulticast(mac))
+			continue;
+
+		res[mac] = { ip: parts[0], dev: parts[5] };
+	}
+
+	return res;
+}
+
+/* аренды DHCP: MAC -> { ip, hostname } */
+function leaseEntries()
+{
+	const res = {};
+	const lines = split(sh('cat /tmp/dhcp.leases 2>/dev/null'), '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		const line = trim(lines[i]);
+		if (!length(line))
+			continue;
+
+		const parts = split(line, /[ \t]+/);
+		if (length(parts) < 4)
+			continue;
+
+		const mac = lc(parts[1]);
+		if (!isMac(mac))
+			continue;
+
+		res[mac] = {
+			ip:       parts[2],
+			hostname: (parts[3] == '*' ? '' : parts[3]),
+		};
+	}
+
+	return res;
+}
+
+/* сбор клиентов по всем источникам */
+function collectClients(ownMacs)
+{
+	const fdb = fdbEntries();
+	const arp = arpEntries();
+	const leases = leaseEntries();
+	const res = {};
+
+	for (let mac, dev in fdb) {
+		res[mac] = { mac: mac, port: dev, ip: '', hostname: '', sources: [ 'fdb' ] };
+	}
+
+	for (let mac, l in leases) {
+		if (res[mac] == null)
+			res[mac] = { mac: mac, port: '', ip: '', hostname: '', sources: [] };
+
+		res[mac].ip = l.ip;
+		res[mac].hostname = l.hostname;
+		push(res[mac].sources, 'dhcp');
+	}
+
+	for (let mac, a in arp) {
+		if (res[mac] == null) {
+			res[mac] = {
+				mac: mac,
+				port: (exists(`${SYSNET}/${a.dev}/bridge`) ? '' : a.dev),
+				ip: a.ip,
+				hostname: '',
+				sources: [ 'arp' ],
+			};
+		}
+		else {
+			if (!length(res[mac].ip))
+				res[mac].ip = a.ip;
+			push(res[mac].sources, 'arp');
+		}
+	}
+
+	/* убираем MAC-адреса самого роутера и его портов */
+	for (let mac, c in res) {
+		if (ownMacs[mac])
+			delete res[mac];
+	}
+
+	return res;
+}
+
+/* ------------------------------------------------------------------ */
+/* основные методы                                                      */
+/* ------------------------------------------------------------------ */
+
+function list()
+{
+	const links = linkInfo();
+	const devices = networkDevices();
+	const interfaces = networkInterfaces();
+	const names = lsdir(SYSNET) ?? [];
+
+	const ports = [];
+	const ownMacs = {};
+
+	/* Ethernet-порты */
+	for (let i = 0; i < length(names); i++) {
+		const name = names[i];
+
+		if (name == 'lo')
+			continue;
+		if (index(name, '.') > -1)
+			continue;                       /* vlan/alias */
+		if (exists(`${SYSNET}/${name}/bridge`))
+			continue;                       /* сам мост */
+		if (exists(`${SYSNET}/${name}/phy80211`))
+			continue;                       /* wi-fi обрабатывается отдельно */
+
+		const base = `${SYSNET}/${name}`;
+		const link = links[name] ?? {};
+
+		let speed = +(sysRead(`${base}/speed`));
+		if (!(speed > 0))
+			speed = 0;
+
+		const mac = lc(link.mac != '' ? link.mac : sysRead(`${base}/address`));
+		if (length(mac))
+			ownMacs[mac] = true;
+
+		let enabled = true;
+		let deviceSection = '';
+
+		const d = devices[name];
+		if (d != null) {
+			enabled = d.enabled;
+			deviceSection = d.section;
+		}
+
+		let role = '';
+		if (interfaces[name])
+			role = interfaces[name];
+		else if (link.master && interfaces[link.master])
+			role = interfaces[link.master];
+
+		push(ports, {
+			name:           name,
+			type:           'ethernet',
+			role:           role,
+			enabled:        enabled,
+			managed:        true,
+			admin_up:       link.admin_up === true,
+			carrier:        (sysRead(`${base}/carrier`) == '1'),
+			operstate:      link.state ?? sysRead(`${base}/operstate`),
+			speed:          speed,
+			duplex:         sysRead(`${base}/duplex`),
+			mtu:            link.mtu ?? +(sysRead(`${base}/mtu`)),
+			mac:            mac,
+			master:         link.master ?? '',
+			ssid:           '',
+			device_section: deviceSection,
+			wifi_section:   '',
+			clients:        0,
+		});
+	}
+
+	/* Wi-Fi точки доступа */
+	const wifiPorts = wirelessPorts();
+
+	for (let i = 0; i < length(wifiPorts); i++) {
+		const w = wifiPorts[i];
+		const name = w.name;
+		const base = `${SYSNET}/${name}`;
+		const present = exists(base);
+		const link = present ? (links[name] ?? {}) : {};
+
+		let mac = '';
+		if (present)
+			mac = lc(link.mac != '' ? link.mac : sysRead(`${base}/address`));
+		if (length(mac))
+			ownMacs[mac] = true;
+
+		push(ports, {
+			name:           name,
+			type:           'wifi',
+			role:           w.network,
+			enabled:        !w.disabled,
+			managed:        true,
+			admin_up:       present && link.admin_up === true,
+			carrier:        present && (sysRead(`${base}/carrier`) == '1'),
+			operstate:      present ? (link.state ?? sysRead(`${base}/operstate`)) : 'down',
+			speed:          0,
+			duplex:         '',
+			mtu:            present ? (link.mtu ?? +(sysRead(`${base}/mtu`))) : 0,
+			mac:            mac,
+			master:         link.master ?? '',
+			ssid:           w.ssid,
+			device_section: '',
+			wifi_section:   w.section,
+			clients:        0,
+		});
+	}
+
+	const clients = collectClients(ownMacs);
+
+	for (let i = 0; i < length(ports); i++) {
+		let n = 0;
+		for (let mac, c in clients) {
+			if (c.port == ports[i].name)
+				n++;
+		}
+		ports[i].clients = n;
+	}
+
+	return {
+		ok: true,
+		ports: ports,
+		clients: clients,
+		bridge: exists(`${SYSNET}/br-lan/bridge`),
+		fdb: length(trim(sh('bridge fdb show 2>/dev/null'))) > 0,
+	};
+}
+
+function setEnabled(args)
+{
+	const port = trim(args?.port ?? '');
+	const want = (args?.enabled === true || args?.enabled == '1' || args?.enabled == 1);
+
+	if (!match(port, /^[A-Za-z0-9_.-]{1,32}$/))
+		return { ok: false, message: 'Некорректное имя порта.' };
+
+	const data = list();
+	let info = null;
+
+	for (let i = 0; i < length(data.ports); i++) {
+		if (data.ports[i].name == port) {
+			info = data.ports[i];
+			break;
+		}
+	}
+
+	if (info == null)
+		return { ok: false, message: `Порт ${port} не найден.` };
+
+	const u = cursor();
+
+	if (info.type == 'wifi') {
+		const sec = info.wifi_section;
+		if (!length(sec))
+			return { ok: false, message: 'Для этого Wi-Fi интерфейса не найден раздел конфигурации.' };
+
+		u.set('wireless', sec, 'disabled', want ? '0' : '1');
+		if (want)
+			u.delete('wireless', sec, 'disabled');
+		u.commit('wireless');
+		sh('wifi reload >/dev/null 2>&1');
+
+		return { ok: true, message: `Wi-Fi интерфейс ${port} ${want ? 'включён' : 'выключен'}.` };
+	}
+
+	let sec = info.device_section;
+	if (!length(sec)) {
+		sec = 'pm_' + port;
+		u.set('network', sec, 'device');
+		u.set('network', sec, 'name', port);
+	}
+
+	u.set('network', sec, 'enabled', want ? '1' : '0');
+	u.commit('network');
+	sh('ubus call network reload >/dev/null 2>&1');
+
+	return { ok: true, message: `Порт ${port} ${want ? 'включён' : 'выключен'}.` };
+}
+
+const methods = {
+	list: {
+		call: function() {
+			return list();
+		}
+	},
+
+	setEnabled: {
+		args: { port: '', enabled: false },
+		call: function(req) {
+			return setEnabled(req.args ?? {});
+		}
+	}
+};
+
+return { 'portmanager': methods };

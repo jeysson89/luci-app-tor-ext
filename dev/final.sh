@@ -1,14 +1,23 @@
 #!/bin/sh
-echo "== install the rebuilt package"
-apk add --allow-untrusted /tmp/luci-app-tor-ext-1.0.0-r1.apk 2>&1 | tail -3
-rm -f /tmp/luci-app-tor-ext-1.0.0-r1.apk
-apk list --installed 2>/dev/null | grep tor-ext
+echo "== FINAL STATE =="
+echo "-- package"
+apk list --installed 2>/dev/null | grep -E 'luci-app-tor-ext|^tor-|conntrack-'
 echo
-echo "== the new ui on the disk"
-grep -c 'fillBackups' /www/luci-static/resources/view/tor-ext/config.js
-grep -c 'backupDelete' /usr/share/rpcd/ucode/tor-ext
+echo "-- the app"
+ubus call tor-ext status | jsonfilter -e 'running=@.service.running' -e 'bootstrap=@.bootstrap.percent' -e 'version=@.version' -e 'ip=@.ip.ip' -e 'tor=@.ip.tor' 2>/dev/null
 echo
-echo "== the state"
-ubus call tor-ext status | jsonfilter -e '@.service.running' -e '@.bootstrap.percent' -e '@.ip.ip' 2>/dev/null
-ubus call tor-ext backups | jsonfilter -e '@.keep' -e '@.backups[*].name' 2>/dev/null
+echo "-- transports"
+ubus call tor-ext bridgesGet | jsonfilter -e '@.transports[*].key' -e '@.transports[*].installed' 2>/dev/null | paste - - 2>/dev/null
+echo
+echo "-- bridges in torrc"
+grep -cE '^Bridge ' /etc/tor/torrc
+echo
+echo "-- services"
+/etc/init.d/tor-ext enabled && echo "tor-ext: enabled"
+/etc/init.d/tor enabled && echo "tor: enabled"
+echo
+echo "-- disk"
 df -h /overlay | tail -1
+echo
+echo "-- backups"
+ubus call tor-ext backups | jsonfilter -e 'keep=@.keep' -e 'count=@.backups[*].name' 2>/dev/null | head -3
