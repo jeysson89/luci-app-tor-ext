@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# luci-app-tor-ext: applies the transparent proxy rules and prepares torrc
+START=40
+STOP=05
+
+start() {
+	. /usr/libexec/tor-ext/lib.sh
+	tor_ext_ensure_baseline
+	/usr/libexec/tor-ext/apply-proxy apply
+}
+
+stop() {
+	/usr/libexec/tor-ext/apply-proxy clear
+}
+
+reload() {
+	/usr/libexec/tor-ext/apply-proxy apply
+}
+
+restart() {
+	stop
+	start
+}
+
+status() {
+	. /usr/libexec/tor-ext/lib.sh
+	if nft list table inet tor_ext >/dev/null 2>&1; then
+		echo "transparent proxy rules loaded"
+	else
+		echo "transparent proxy rules not loaded"
+	fi
+}

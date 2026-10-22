@@ -1,0 +1,8 @@
+# служебные файлы и временные артефакты
+dev/_fix.log
+dev/*.uc
+dev/patch*.py
+*.pyc
+__pycache__/
+Thumbs.db
+.DS_Store

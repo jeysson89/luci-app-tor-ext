@@ -1,0 +1,5 @@
+#!/bin/sh
+# luci-app-tor-ext: first boot defaults
+# The real work is done by the migration script, it is idempotent.
+[ -x /usr/libexec/tor-ext/migrate ] && /usr/libexec/tor-ext/migrate
+exit 0

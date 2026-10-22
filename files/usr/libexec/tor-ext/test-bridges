@@ -1,0 +1,80 @@
+#!/bin/sh
+# Isolated bootstrap test for a candidate bridge configuration.
+# The backend writes /tmp/tor-ext/test/candidate.conf beforehand.
+# Progress is published in /tmp/tor-ext/test/{state,guards,log}.
+. /usr/libexec/tor-ext/lib.sh
+
+TD="$TOR_EXT_STATE/test"
+CAND="$TD/candidate.conf"
+RUN="$TD/run.torrc"
+CTL_PORT=19051
+MAX_TICKS=40
+TICK=3
+
+mkdir -p "$TD"
+rm -rf "$TD/data" "$TD/guards" "$TD/log" "$TD/err.log" "$TD/state"
+echo "running 0 starting" > "$TD/state"
+
+[ -s "$CAND" ] || { echo "error 0 no candidate configuration" > "$TD/state"; exit 1; }
+
+mkdir -p "$TD/data"
+chmod 700 "$TD/data"
+
+{
+	echo "DataDirectory $TD/data"
+	echo "SocksPort 0"
+	echo "ControlPort 127.0.0.1:$CTL_PORT"
+	echo "CookieAuthentication 0"
+	echo "Log debug file $TD/tor.log"
+	echo "SafeLogging 1"
+	echo "ClientUseIPv6 0"
+	cat "$CAND"
+} > "$RUN"
+
+# tor refuses a world readable config in some builds; keep it private
+chmod 600 "$RUN"
+
+tor -f "$RUN" >"$TD/err.log" 2>&1 &
+TPID=$!
+echo "$TPID" > "$TD/pid"
+
+percent=0
+phase=starting
+tick=0
+while [ "$tick" -lt "$MAX_TICKS" ]; do
+	sleep "$TICK"
+	tick=$((tick + 1))
+	if ! kill -0 "$TPID" 2>/dev/null; then
+		phase="tor exited"
+		break
+	fi
+	resp=$(/usr/libexec/tor-ext/ctl -n -p "$CTL_PORT" 'GETINFO status/bootstrap-phase' 2>/dev/null)
+	line=$(printf '%s' "$resp" | sed -n 's/^250[-+]status\/bootstrap-phase=//p' | head -n1)
+	[ -n "$line" ] || line=$(printf '%s' "$resp" | grep -o 'PROGRESS=[0-9]*.*')
+	p=$(printf '%s' "$line" | sed -n 's/.*PROGRESS=\([0-9]*\).*/\1/p')
+	t=$(printf '%s' "$line" | sed -n 's/.*TAG=\([A-Za-z0-9_]*\).*/\1/p')
+	[ -n "$p" ] && percent="$p"
+	[ -n "$t" ] && phase="$t"
+	echo "running $percent $phase" > "$TD/state"
+	[ "$percent" -ge 100 ] 2>/dev/null && break
+done
+
+/usr/libexec/tor-ext/ctl -n -p "$CTL_PORT" 'GETINFO entry-guards' > "$TD/guards" 2>/dev/null
+
+kill "$TPID" 2>/dev/null
+sleep 1
+kill -9 "$TPID" 2>/dev/null
+rm -f "$TD/pid"
+rm -rf "$TD/data"
+
+if [ "$percent" -ge 100 ] 2>/dev/null; then
+	echo "done 100 $phase" > "$TD/state"
+else
+	[ "$phase" = "tor exited" ] || phase="$phase"
+	echo "done $percent $phase" > "$TD/state"
+fi
+
+cp "$TD/tor.log" "$TD/log" 2>/dev/null
+cp "$TD/err.log" "$TD/err" 2>/dev/null
+logger -t tor-ext "bridge test finished: bootstrap ${percent}% (${phase})"
+exit 0

@@ -1,0 +1,55 @@
+#!/bin/sh
+# Lightweight watchdog for the tor service, run from cron every 5 minutes.
+. /usr/libexec/tor-ext/lib.sh
+
+STATE="$TOR_EXT_STATE/watchdog"
+FAILS=0
+LAST_ALERT=0
+[ -r "$STATE" ] && . "$STATE"
+
+enabled=$(tor_ext_uci watchdog.enabled 0)
+[ "$enabled" = "1" ] || exit 0
+
+now=$(date +%s)
+problem=""
+percent=100
+
+if ! tor_ext_running; then
+	problem="Tor не запущен"
+else
+	resp=$(/usr/libexec/tor-ext/ctl 'GETINFO status/bootstrap-phase' 2>/dev/null)
+	percent=$(printf '%s' "$resp" | sed -n 's/.*PROGRESS=\([0-9]*\).*/\1/p' | head -n1)
+	[ -n "$percent" ] || percent=0
+	if [ "$percent" -lt 100 ]; then
+		problem="Tor не завершил загрузку (${percent}%)"
+	fi
+fi
+
+if [ -z "$problem" ]; then
+	if [ "$FAILS" != "0" ] && [ "${RECOVERED:-0}" = "1" ]; then
+		/usr/libexec/tor-ext/notify "Tor восстановлен: соединение установлено (bootstrap 100%)"
+		RECOVERED=0
+	fi
+	FAILS=0
+	printf 'FAILS=0\nRECOVERED=0\nLAST_ALERT=%s\n' "$LAST_ALERT" > "$STATE"
+	exit 0
+fi
+
+FAILS=$((FAILS + 1))
+
+# Alert at most every 30 minutes
+if [ $((now - LAST_ALERT)) -ge 1800 ]; then
+	/usr/libexec/tor-ext/notify "$problem (роутер $(cat /proc/sys/kernel/hostname))"
+	LAST_ALERT=$now
+fi
+
+auto_restart=$(tor_ext_uci watchdog.auto_restart 1)
+if [ "$auto_restart" = "1" ] && [ "$FAILS" -ge 2 ]; then
+	logger -t tor-ext "watchdog: restarting tor after $FAILS failed checks"
+	/etc/init.d/tor restart >/dev/null 2>&1
+	FAILS=0
+	RECOVERED=1
+fi
+
+printf 'FAILS=%s\nRECOVERED=%s\nLAST_ALERT=%s\n' "$FAILS" "$RECOVERED" "$LAST_ALERT" > "$STATE"
+exit 0

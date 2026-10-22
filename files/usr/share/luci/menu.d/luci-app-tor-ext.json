@@ -1,0 +1,119 @@
+{
+	"admin/services/tor-ext": {
+		"title": "Tor",
+		"order": 55,
+		"action": {
+			"type": "firstchild",
+			"recurse": true
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/status": {
+		"title": "Статус",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/status"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/bridges": {
+		"title": "Мосты",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/bridges"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/config": {
+		"title": "Конфигурация",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/config"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/ports": {
+		"title": "Порты и сервисы",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/ports"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/proxy": {
+		"title": "Проксирование",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/proxy"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/logs": {
+		"title": "Логи",
+		"order": 70,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/logs"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/monitor": {
+		"title": "Мониторинг",
+		"order": 80,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/monitor"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
+	"admin/services/tor-ext/traffic": {
+		"title": "Трафик",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/traffic"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	}
+}

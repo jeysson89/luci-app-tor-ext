@@ -1,0 +1,30 @@
+#!/bin/sh
+# Send a notification to the configured channel (Telegram and/or webhook).
+# Usage: notify "message text"
+. /usr/libexec/tor-ext/lib.sh
+
+[ -n "$1" ] || exit 1
+msg="$1"
+enabled=$(tor_ext_uci notify.enabled 0)
+[ "$enabled" = "1" ] || exit 0
+
+token=$(tor_ext_uci notify.telegram_token "")
+chat=$(tor_ext_uci notify.telegram_chat "")
+webhook=$(tor_ext_uci notify.webhook "")
+
+if [ -n "$token" ] && [ -n "$chat" ]; then
+	curl -s -m 15 -o /dev/null \
+		--data-urlencode "chat_id=$chat" \
+		--data-urlencode "text=$msg" \
+		"https://api.telegram.org/bot$token/sendMessage" \
+		|| logger -t tor-ext "notify: telegram delivery failed"
+fi
+
+if [ -n "$webhook" ]; then
+	curl -s -m 15 -o /dev/null -X POST \
+		--data-urlencode "text=$msg" \
+		"$webhook" \
+		|| logger -t tor-ext "notify: webhook delivery failed"
+fi
+
+logger -t tor-ext "notify: $msg"

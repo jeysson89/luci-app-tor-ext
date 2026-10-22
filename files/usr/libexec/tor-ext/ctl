@@ -1,0 +1,30 @@
+#!/bin/sh
+# Thin wrapper around the tor control port.
+# Usage: ctl [-p port] "COMMAND" ...
+# Uses CookieAuthentication when a cookie file is present, otherwise tries
+# an unauthenticated AUTHENTICATE (used by isolated test instances).
+. /usr/libexec/tor-ext/lib.sh
+
+port=""
+noauth=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-p) port="$2"; shift 2 ;;
+		-n) noauth=1; shift ;;
+		*) break ;;
+	esac
+done
+[ -n "$port" ] || port=$(torrc_port ControlPort 9051)
+ck=""
+if [ "$noauth" = "0" ] && [ -r "$TOR_COOKIE" ]; then
+	ck=$(hexdump -v -e '32/1 "%02x"' "$TOR_COOKIE" 2>/dev/null | tr -d ' \n')
+fi
+{
+	if [ -n "$ck" ]; then
+		printf 'AUTHENTICATE %s\r\n' "$ck"
+	else
+		printf 'AUTHENTICATE\r\n'
+	fi
+	for c in "$@"; do printf '%s\r\n' "$c"; done
+	printf 'QUIT\r\n'
+} | nc 127.0.0.1 "$port" 2>/dev/null

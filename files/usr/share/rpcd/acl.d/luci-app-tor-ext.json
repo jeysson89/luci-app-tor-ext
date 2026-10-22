@@ -1,0 +1,60 @@
+{
+	"luci-app-tor-ext": {
+		"description": "Grant access to the Tor management application",
+		"read": {
+			"ubus": {
+				"tor-ext": [
+					"status",
+					"torrcGet",
+					"backups",
+					"bridgesGet",
+					"bridgesTestStatus",
+					"portsGet",
+					"proxyGet",
+					"proxyPreview",
+					"logs",
+					"checkIp",
+					"settingsGet",
+					"trafficGet",
+					"trafficResolve",
+					"bridgeTestStart",
+					"trafficClose"
+				],
+				"luci-rpc": [
+					"getDHCPLeases",
+					"getHostHints"
+				],
+				"service": [
+					"list"
+				]
+			},
+			"uci": [
+				"tor_ext"
+			]
+		},
+		"write": {
+			"ubus": {
+				"tor-ext": [
+					"action",
+					"torrcSave",
+					"torrcVerify",
+					"backupRestore",
+					"bridgesSave",
+					"bridgesTest",
+					"portsSave",
+					"hsAdd",
+					"hsDel",
+					"proxySave",
+					"settingsSave",
+					"settingsTest",
+					"checkIp",
+					"bridgeTestStart",
+					"trafficClose"
+				]
+			},
+			"uci": [
+				"tor_ext"
+			]
+		}
+	}
+}

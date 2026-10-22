@@ -1,0 +1,1667 @@
+'use strict';
+// luci-app-tor-ext: rpcd/ubus backend
+// Exposes tor status, torrc editing, bridge management, ports, hidden
+// services, transparent proxy and logs to the LuCI frontend.
+
+import { cursor } from 'uci';
+import { popen, readfile, writefile, stat, lsdir, unlink, mkdir, rename } from 'fs';
+
+const TORRC      = '/etc/tor/torrc';
+const TOR_DATA   = '/var/lib/tor';
+const TOR_LOG    = '/var/log/tor.log';
+const STATE      = '/tmp/tor-ext';
+const BACKUP_DIR = '/etc/tor/backups';
+const CTL        = '/usr/libexec/tor-ext/ctl';
+
+/* ------------------------------------------------------------------ */
+/* generic helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+function sh(cmd) {
+	let p = popen(cmd);
+	if (!p)
+		return '';
+	let out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function shrc(cmd) {
+	const p = popen(cmd);
+	const out = p ? (p.read('all') ?? '') : '';
+	const rc = p ? p.close() : -1;
+	return { out, rc };
+}
+
+function shq(s) {
+	return `'${replace(s ?? '', "'", "'\\''")}'`;
+}
+
+function exists(path) {
+	return stat(path) != null;
+}
+
+function readText(path) {
+	return readfile(path) ?? '';
+}
+
+function uciGet(key, fallback) {
+	const uci = cursor();
+	const parts = split(key, '.');
+	const val = uci.get('tor_ext', parts[0], parts[1]);
+	return (val == null || val == '') ? fallback : val;
+}
+
+function uciApply(pairs) {
+	const uci = cursor();
+	for (let i = 0; i < length(pairs); i++)
+		uci.set('tor_ext', pairs[i][0], pairs[i][1], pairs[i][2]);
+	uci.commit('tor_ext');
+}
+
+function nowStamp() {
+	return trim(sh('date +%Y%m%d-%H%M%S'));
+}
+
+function chmodSafe(path, mode) {
+	sh(`chmod ${mode} ${shq(path)} 2>/dev/null`);
+}
+
+function writeAtomic(path, data, mode) {
+	const tmp = path + '.tmp';
+	if (writefile(tmp, data) == null)
+		return false;
+	chmodSafe(tmp, mode ?? '600');
+	rename(tmp, path);
+	return true;
+}
+
+function ensureDir(path, mode) {
+	if (!exists(path))
+		mkdir(path, mode ?? 0o755);
+}
+
+function jsonParse(str) {
+	try {
+		return json(str);
+	} catch (e) {
+		return null;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* torrc helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function torrcRead() {
+	return readText(TORRC);
+}
+
+function directiveValues(text, name) {
+	const out = [];
+	const lines = split(text, '\n');
+	const lname = lc(name);
+
+	for (let i = 0; i < length(lines); i++) {
+		const t = trim(lines[i]);
+		if (!length(t) || substr(t, 0, 1) == '#')
+			continue;
+		const m = match(t, /^([A-Za-z][A-Za-z0-9_]*)[ \t]+(.*)$/);
+		if (!m || lc(m[1]) != lname)
+			continue;
+		push(out, trim(m[2]));
+	}
+	return out;
+}
+
+function directiveFirst(text, name, fallback) {
+	const vals = directiveValues(text, name);
+	return length(vals) ? vals[0] : fallback;
+}
+
+// Replace (or remove) all active occurrences of the given directives.
+// changes: [ { name, lines: [] }, ... ]
+function rewriteDirectives(text, changes) {
+	const lines = split(text, '\n');
+	const out = [];
+	const done = {};
+
+	for (let i = 0; i < length(lines); i++) {
+		const raw = lines[i];
+		const t = trim(raw);
+		let key = null;
+
+		if (length(t) && substr(t, 0, 1) != '#' && substr(t, 0, 1) != '%') {
+			const m = match(t, /^([A-Za-z][A-Za-z0-9_]*)[ \t]+/);
+			if (m)
+				key = lc(m[1]);
+		}
+
+		let change = null;
+		for (let j = 0; j < length(changes); j++)
+			if (lc(changes[j].name) == key) {
+				change = changes[j];
+				break;
+			}
+
+		if (change == null) {
+			push(out, raw);
+			continue;
+		}
+
+		if (done[key])
+			continue;
+
+		done[key] = true;
+		if (change.lines)
+			for (let k = 0; k < length(change.lines); k++)
+				push(out, change.lines[k]);
+	}
+
+	for (let j = 0; j < length(changes); j++) {
+		const key = lc(changes[j].name);
+		if (done[key] || !changes[j].lines || !length(changes[j].lines))
+			continue;
+		for (let k = 0; k < length(changes[j].lines); k++)
+			push(out, changes[j].lines[k]);
+		done[key] = true;
+	}
+
+	// collapse more than two consecutive empty lines
+	const clean = [];
+	let empty = 0;
+	for (let i = 0; i < length(out); i++) {
+		if (trim(out[i]) == '') {
+			empty++;
+			if (empty > 2)
+				continue;
+		}
+		else
+			empty = 0;
+		push(clean, out[i]);
+	}
+
+	return join('\n', clean);
+}
+
+function verifyTorrc(content) {
+	ensureDir(STATE, '700');
+	const tmp = `${STATE}/verify.torrc`;
+	if (writefile(tmp, content) == null)
+		return { ok: false, message: 'cannot write temporary file' };
+	chmodSafe(tmp, '600');
+	const res = shrc(`tor --verify-config -f ${shq(tmp)} 2>&1`);
+	unlink(tmp);
+
+	const errs = [];
+	const lines = split(res.out, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const l = trim(lines[i]);
+		if (!length(l) || index(l, 'running as root') > -1)
+			continue;
+		if (match(l, /\[(warn|err)\]/))
+			push(errs, l);
+	}
+
+	const ok = (res.rc == 0);
+	return {
+		ok,
+		message: ok ? 'Конфигурация корректна' : (length(errs) ? join('\n', errs) : (trim(res.out) || 'Ошибка проверки'))
+	};
+}
+
+/* how many backups are kept, the value is taken from the uci config */
+function backupKeep() {
+	const v = +(uciGet('backup.keep', '20'));
+	if (v < 1)
+		return 1;
+	if (v > 100)
+		return 100;
+	return v;
+}
+
+function backupList() {
+	const files = [];
+	const entries = lsdir(BACKUP_DIR) ?? [];
+	for (let i = 0; i < length(entries); i++)
+		if (match(entries[i], /^torrc\.[0-9]{8}-[0-9]{6}$/))
+			push(files, entries[i]);
+	sort(files);
+	return files;
+}
+
+function backupTorrc() {
+	ensureDir(BACKUP_DIR, 0o700);
+	const name = `torrc.${nowStamp()}`;
+	const dst = `${BACKUP_DIR}/${name}`;
+	if (!exists(TORRC))
+		return null;
+	writefile(dst, torrcRead());
+	chmodSafe(dst, '600');
+
+	/* remove the outdated copies */
+	const keep = backupKeep();
+	const files = backupList();
+	while (length(files) > keep)
+		unlink(`${BACKUP_DIR}/${shift(files)}`);
+
+	return name;
+}
+
+/* ------------------------------------------------------------------ */
+/* tor control port                                                    */
+/* ------------------------------------------------------------------ */
+
+function parseCtl(raw) {
+	const res = {};
+	const lines = split(raw ?? '', '\n');
+	let multi = null;
+	let buf = [];
+
+	for (let i = 0; i < length(lines); i++) {
+		const l = rtrim(lines[i], '\r');
+
+		if (multi != null) {
+			if (l == '.') {
+				res[multi] = join('\n', buf);
+				multi = null;
+				buf = [];
+				continue;
+			}
+			push(buf, replace(l, /^250\+/, ''));
+			continue;
+		}
+
+		let m = match(l, /^250\+([A-Za-z0-9\/._-]+)=(.*)$/);
+		if (m) {
+			if (m[2] == '') {
+				multi = m[1];
+				buf = [];
+			}
+			else {
+				res[m[1]] = m[2];
+			}
+			continue;
+		}
+
+		m = match(l, /^250[- ]([A-Za-z0-9\/._-]+)=(.*)$/);
+		if (m) {
+			res[m[1]] = m[2];
+			continue;
+		}
+
+		m = match(l, /^([0-9]{3}) (.*)$/);
+		if (m && m[1] != '250') {
+			res['_error'] = `${m[1]} ${m[2]}`;
+		}
+	}
+	return res;
+}
+
+function ctl(cmds) {
+	let cmdline = CTL;
+	for (let i = 0; i < length(cmds); i++)
+		cmdline += ' ' + shq(cmds[i]);
+	return parseCtl(sh(cmdline));
+}
+
+function parseBootstrap(phase) {
+	phase = phase ?? '';
+	const pm = match(phase, /PROGRESS=([0-9]+)/);
+	const tm = match(phase, /TAG=([A-Za-z0-9_]+)/);
+	const sm = match(phase, /SUMMARY="?([^"]*)"?$/);
+	return {
+		percent: pm ? +pm[1] : 0,
+		tag: tm ? tm[1] : '',
+		summary: sm ? trim(sm[1]) : ''
+	};
+}
+
+function parseGuards(text) {
+	const out = [];
+	const lines = split(text ?? '', '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		const t = trim(lines[i]);
+		if (!length(t))
+			continue;
+		const parts = split(t, /[ \t]+/);
+		const id = parts[0] ?? '';
+		const state = parts[1] ?? '';
+		const name = (index(id, '~') > -1) ? substr(id, index(id, '~') + 1) : id;
+		const fp = (index(id, '$') == 0) ? substr(id, 1, 40) : '';
+		push(out, {
+			id, name, fp,
+			state,
+			bridge: (index(t, 'Bridge') > -1),
+			connections: (index(t, 'CONNECTED') > -1 || state == 'up')
+		});
+	}
+	return out;
+}
+
+function parseCircuits(text) {
+	const out = [];
+	const lines = split(text ?? '', '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const t = trim(lines[i]);
+		if (!length(t))
+			continue;
+		const parts = split(t, /[ \t]+/);
+		const path = parts[2] ?? '';
+		const hops = split(path, ',');
+		let exit = '';
+		if (length(hops)) {
+			const last = hops[length(hops) - 1];
+			exit = (index(last, '~') > -1) ? substr(last, index(last, '~') + 1) : last;
+		}
+		push(out, {
+			id: parts[0],
+			state: parts[1],
+			path,
+			exit,
+			purpose: (match(t, /PURPOSE=([^\s]+)/) ?? [])[1] ?? ''
+		});
+	}
+	return out;
+}
+
+function serviceStatus() {
+	const raw = sh(`ubus call service list '{"name":"tor","verbose":true}' 2>/dev/null`);
+	const data = jsonParse(raw) ?? {};
+	const inst = data?.tor?.instances ?? {};
+	let pid = null, uptime = 0, respawn = null;
+
+	for (let name, i in inst) {
+		if (inst[name].running) {
+			pid = inst[name].pid ?? null;
+			uptime = inst[name].uptime ?? 0;
+			respawn = inst[name].respawn ?? null;
+			break;
+		}
+	}
+
+	let enabled = false;
+	const rc = lsdir('/etc/rc.d') ?? [];
+	for (let i = 0; i < length(rc); i++)
+		if (match(rc[i], /^S[0-9]+tor$/))
+			enabled = true;
+
+	return { running: (pid != null && exists(`/proc/${pid}`)), pid, uptime, respawn, enabled };
+}
+
+/* ------------------------------------------------------------------ */
+/* bridges                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Supported pluggable transports. The order defines the order of the
+ * sections shown in the web interface. */
+const TRANSPORTS = {
+	obfs4:     { label: 'obfs4',     bin: '/usr/bin/obfs4proxy',      alt: '/usr/bin/lyrebird',      plugin: 'obfs4' },
+	snowflake: { label: 'snowflake', bin: '/usr/bin/snowflake-client', alt: '/usr/bin/lyrebird',      plugin: 'snowflake' },
+	meek:      { label: 'meek_lite', bin: '/usr/bin/meek-client',     alt: '/usr/bin/obfs4proxy',   plugin: 'meek_lite' },
+	webtunnel: { label: 'webtunnel', bin: '/usr/bin/webtunnel-client', alt: '/usr/bin/lyrebird',      plugin: 'webtunnel' },
+	vanilla:   { label: 'Обычный мост (без транспорта)', bin: null, alt: null, plugin: null }
+};
+
+const TRANSPORT_ORDER = ['obfs4', 'snowflake', 'meek', 'webtunnel', 'vanilla'];
+
+/* lyrebird implements every modern transport in a single binary and expects
+ * one plugin line for all of them (the same way Tor Browser does) */
+const LYREBIRD = '/usr/bin/lyrebird';
+const LYREBIRD_PLUGIN = 'ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit,webtunnel,snowflake exec ' + LYREBIRD;
+
+function transportInfo(key) {
+	const t = TRANSPORTS[key];
+	if (!t)
+		return null;
+
+	let bin = null;
+	if (key != 'vanilla' && exists(LYREBIRD))
+		bin = LYREBIRD;
+	else if (t.bin && exists(t.bin))
+		bin = t.bin;
+	else if (t.alt && exists(t.alt))
+		bin = t.alt;
+
+	return {
+		key,
+		label: t.label,
+		installed: (bin != null),
+		binary: bin,
+		plugin: t.plugin
+	};
+}
+
+function transportList() {
+	const out = [];
+	for (let i = 0; i < length(TRANSPORT_ORDER); i++) {
+		const info = transportInfo(TRANSPORT_ORDER[i]);
+		if (info)
+			push(out, info);
+	}
+	return out;
+}
+
+function bridgePluginLine(transport) {
+	const info = transportInfo(transport);
+	if (!info || !info.plugin || !info.binary)
+		return null;
+
+	if (info.binary == LYREBIRD)
+		return LYREBIRD_PLUGIN;
+
+	return `ClientTransportPlugin ${info.plugin} exec ${info.binary}`;
+}
+
+/* Detect the transport of a single bridge line. */
+function bridgeTypeFromSpec(spec) {
+	const parts = split(trim(spec), /[ \t]+/);
+	const head = lc(parts[0] ?? '');
+
+	if (head == 'obfs4' || head == 'snowflake' || head == 'webtunnel')
+		return head;
+	if (head == 'meek' || head == 'meek_lite')
+		return 'meek';
+	return 'vanilla';
+}
+
+function parseBridgeLine(value) {
+	const v = trim(value ?? '');
+	const parts = split(v, /[ \t]+/);
+	const type = bridgeTypeFromSpec(v);
+	const fpm = match(v, /\b([0-9A-Fa-f]{40})\b/);
+
+	return {
+		type,
+		line: v,
+		addr: parts[1] ?? (type == 'vanilla' ? (parts[0] ?? '') : ''),
+		fp: fpm ? uc(fpm[1]) : ''
+	};
+}
+
+/* a short fingerprint of the torrc, used to detect manual changes */
+function torrcRevision() {
+	const st = stat(TORRC);
+	return `${st?.mtime ?? 0}:${st?.size ?? 0}`;
+}
+
+function bridgesState() {
+	const torrc = torrcRead();
+	const values = directiveValues(torrc, 'Bridge');
+	const bridges = [];
+
+	for (let i = 0; i < length(values); i++)
+		push(bridges, parseBridgeLine(values[i]));
+
+	return {
+		transports: transportList(),
+		bridges,
+		use_bridges: directiveFirst(torrc, 'UseBridges', '0') == '1',
+		plugins: directiveValues(torrc, 'ClientTransportPlugin'),
+		revision: torrcRevision()
+	};
+}
+
+/* Build the torrc lines for a list of bridges. Returns the plugin lines
+ * and the bridge lines separately. */
+function bridgeCandidate(bridges) {
+	const pluginLines = [];
+	const bridgeLines = [];
+	const seen = {};
+
+	for (let i = 0; i < length(bridges); i++) {
+		const b = bridges[i];
+		const type = b?.type ?? 'vanilla';
+		let line = trim(b?.line ?? '');
+
+		if (!length(line) || substr(line, 0, 1) == '#')
+			continue;
+		if (lc(substr(line, 0, 6)) == 'bridge')
+			line = trim(substr(line, 7));
+
+		if (!length(line))
+			continue;
+
+		const plugin = bridgePluginLine(type);
+		if (plugin && !seen[plugin]) {
+			push(pluginLines, plugin);
+			seen[plugin] = true;
+		}
+
+		push(bridgeLines, `Bridge ${line}`);
+	}
+
+	return { plugin: pluginLines, bridges: bridgeLines };
+}
+
+/* ------------------------------------------------------------------ */
+/* transparent proxy                                                   */
+/* ------------------------------------------------------------------ */
+
+function uciShowList(option) {
+	const out = [];
+	const raw = trim(sh(`uci -q get tor_ext.${option} 2>/dev/null`));
+	const vals = split(raw, /[ \t]+/);
+	for (let i = 0; i < length(vals); i++)
+		if (length(vals[i]))
+			push(out, vals[i]);
+	return out;
+}
+
+function proxyState() {
+	const st = {};
+
+	const raw = readText(`${STATE}/proxy.applied`);
+	const lines = split(raw, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const pos = index(lines[i], '=');
+		if (pos < 1)
+			continue;
+		st[substr(lines[i], 0, pos)] = substr(lines[i], pos + 1);
+	}
+
+	const applied = exists(`${STATE}/proxy.applied`);
+	const rule = sh('nft list table inet tor_ext 2>/dev/null');
+
+	const counters = sh(`nft list table inet tor_ext 2>/dev/null | grep -o "counter packets [0-9]* bytes [0-9]*"`);
+	let packets = 0, bytes = 0;
+	const clines = split(counters, '\n');
+	for (let i = 0; i < length(clines); i++) {
+		const m = match(clines[i], /counter packets ([0-9]+) bytes ([0-9]+)/);
+		if (m) {
+			packets += +m[1];
+			bytes += +m[2];
+		}
+	}
+
+	const clients = [];
+	const list = uciShowList('proxy.client');
+	for (let i = 0; i < length(list); i++)
+		push(clients, list[i]);
+
+	return {
+		enabled: uciGet('proxy.enabled', '0') == '1',
+		mode: uciGet('proxy.mode', 'clients'),
+		redirect_dns: uciGet('proxy.redirect_dns', '1') == '1',
+		redirect_tcp: uciGet('proxy.redirect_tcp', '1') == '1',
+		killswitch: uciGet('proxy.killswitch', '1') == '1',
+		block_ipv6: uciGet('proxy.block_ipv6', '1') == '1',
+		block_quic: uciGet('proxy.block_quic', '1') == '1',
+		block_dot: uciGet('proxy.block_dot', '1') == '1',
+		router_traffic: uciGet('proxy.router_traffic', '0') == '1',
+		clients,
+		applied,
+		applied_at: applied ? (stat(`${STATE}/proxy.applied`)?.mtime ?? 0) : 0,
+		lan_device: (st.lan_dev ?? ''),
+		packets,
+		bytes,
+		rules_loaded: length(trim(rule)) > 0
+	};
+}
+
+
+function proxySaveArgs(args) {
+	const clients = args.clients ?? [];
+	const clean = [];
+	for (let i = 0; i < length(clients); i++) {
+		const c = trim(clients[i]);
+		if (!match(c, /^[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]{1,2})?$/))
+			continue;
+		push(clean, c);
+	}
+
+	uciApply([
+		['proxy', 'enabled', args.enabled ? '1' : '0'],
+		['proxy', 'mode', (args.mode == 'all') ? 'all' : 'clients'],
+		['proxy', 'redirect_dns', args.redirect_dns ? '1' : '0'],
+		['proxy', 'redirect_tcp', args.redirect_tcp ? '1' : '0'],
+		['proxy', 'killswitch', args.killswitch ? '1' : '0'],
+		['proxy', 'block_ipv6', args.block_ipv6 ? '1' : '0'],
+		['proxy', 'block_quic', args.block_quic ? '1' : '0'],
+		['proxy', 'block_dot', args.block_dot ? '1' : '0'],
+		['proxy', 'router_traffic', args.router_traffic ? '1' : '0'],
+		['proxy', 'client', length(clean) ? clean : null]
+	]);
+}
+
+/* ------------------------------------------------------------------ */
+/* status                                                              */
+/* ------------------------------------------------------------------ */
+
+function torrcPort(key, fallback) {
+	const v = directiveFirst(torrcRead(), key, fallback);
+	const t = split(trim(v), /[ \t]+/)[0] ?? fallback;
+	const p = (index(t, ':') > -1) ? substr(t, index(t, ':') + 1) : t;
+	return match(p, /^[0-9]+$/) ? p : fallback;
+}
+
+function ipCheckCached(force) {
+	const cacheFile = `${STATE}/ipcheck.json`;
+	if (!force && exists(cacheFile)) {
+		const st = stat(cacheFile);
+		const cached = jsonParse(readText(cacheFile));
+		if (cached && st && (time() - st.mtime) < 120)
+			return cached;
+	}
+
+	const socks = torrcPort('SocksPort', '9050');
+	const started = time();
+	let raw = trim(sh(`curl -s -m 20 --socks5-hostname 127.0.0.1:${socks} https://check.torproject.org/api/ip 2>/dev/null`));
+	let res = jsonParse(raw);
+	let result;
+
+	if (res && res.IP) {
+		result = { ok: true, ip: res.IP, tor: res.IsTor == true, checked: time(), elapsed: time() - started };
+	}
+	else {
+		raw = trim(sh(`curl -s -m 20 --socks5-hostname 127.0.0.1:${socks} https://api.ipify.org?format=json 2>/dev/null`));
+		res = jsonParse(raw);
+		result = (res && res.ip)
+			? { ok: true, ip: res.ip, tor: null, checked: time(), elapsed: time() - started }
+			: { ok: false, error: 'Нет ответа через Tor (проверьте bootstrap и SocksPort)', checked: time(), elapsed: time() - started };
+	}
+
+	ensureDir(STATE, 0o700);
+	writefile(cacheFile, sprintf('%J', result));
+	return result;
+}
+
+
+function fullStatus() {
+	const torrc = torrcRead();
+	const svc = serviceStatus();
+	const info = ctl([
+		'GETINFO version',
+		'GETINFO status/bootstrap-phase',
+		'GETINFO status/circuit-established',
+		'GETINFO circuit-status',
+		'GETINFO traffic/read',
+		'GETINFO traffic/written',
+		'GETINFO uptime',
+		'GETINFO net/listeners/socks',
+		'GETINFO net/listeners/trans',
+		'GETINFO net/listeners/dns',
+		'GETINFO net/listeners/control',
+		'GETINFO entry-guards'
+	]);
+
+	const bootstrap = parseBootstrap(info['status/bootstrap-phase']);
+	const guards = parseGuards(info['entry-guards']);
+	const circuits = parseCircuits(info['circuit-status']);
+	const bridges = bridgesState();
+
+	const bridgeFps = {};
+	for (let i = 0; i < length(bridges.bridges); i++) {
+		const m = match(bridges.bridges[i], /\b([0-9A-Fa-f]{40})\b/);
+		if (m)
+			bridgeFps[uc(m[1])] = true;
+	}
+
+	const bridgeGuards = [];
+	for (let i = 0; i < length(guards); i++) {
+		if (bridgeFps[uc(guards[i].fp)] || guards[i].bridge)
+			push(bridgeGuards, guards[i]);
+	}
+
+	let built = 0;
+	for (let i = 0; i < length(circuits); i++)
+		if (circuits[i].state == 'BUILT')
+			built++;
+
+	const listeners = {
+		socks: replace(info['net/listeners/socks'] ?? '', '"', ''),
+		trans: replace(info['net/listeners/trans'] ?? '', '"', ''),
+		dns: replace(info['net/listeners/dns'] ?? '', '"', ''),
+		control: replace(info['net/listeners/control'] ?? '', '"', '')
+	};
+
+	return {
+		ok: true,
+		service: svc,
+		version: info['version'] ?? '',
+		uptime: +(info['uptime'] ?? 0),
+		bootstrap,
+		circuit_established: (info['status/circuit-established'] ?? '0') == '1',
+		circuits: { total: length(circuits), built, exit: (length(circuits) ? circuits[0].exit : '') },
+		traffic: {
+			read: +(info['traffic/read'] ?? 0),
+			written: +(info['traffic/written'] ?? 0)
+		},
+		listeners,
+		ports: {
+			socks: torrcPort('SocksPort', '9050'),
+			trans: torrcPort('TransPort', '9040'),
+			dns: torrcPort('DNSPort', '9053'),
+			control: torrcPort('ControlPort', '9051')
+		},
+		bridges: {
+			mode: (length(bridges.bridges) ? bridges.bridges[0].type : 'none'),
+			enabled: bridges.use_bridges,
+			count: length(bridges.bridges),
+			guards: bridgeGuards
+		},
+		proxy: proxyState(),
+		ip: ipCheckCached(false),
+		torrc_mtime: stat(TORRC)?.mtime ?? 0
+	};
+}
+
+/* ------------------------------------------------------------------ */
+/* hidden services                                                     */
+/* ------------------------------------------------------------------ */
+
+function hiddenServices() {
+	const torrc = torrcRead();
+	const lines = split(torrc, '\n');
+	const list = [];
+	let current = null;
+
+	for (let i = 0; i < length(lines); i++) {
+		const t = trim(lines[i]);
+		if (!length(t) || substr(t, 0, 1) == '#')
+			continue;
+
+		let m = match(t, /^HiddenServiceDir[ \t]+(.+)$/i);
+		if (m) {
+			current = { dir: trim(m[1]), ports: [], hostname: '', version: '' };
+			push(list, current);
+			continue;
+		}
+
+		m = match(t, /^HiddenServicePort[ \t]+(.+)$/i);
+		if (m && current) {
+			const parts = split(trim(m[1]), /[ \t]+/);
+			push(current.ports, {
+				vport: parts[0] ?? '',
+				target: parts[1] ?? ''
+			});
+		}
+	}
+
+	for (let i = 0; i < length(list); i++) {
+		const hn = readText(`${list[i].dir}/hostname`);
+		list[i].hostname = trim(hn);
+		if (exists(`${list[i].dir}/hs_ed25519_public_key`))
+			list[i].version = 'v3';
+		else if (exists(`${list[i].dir}/private_key`))
+			list[i].version = 'v2';
+		const st = stat(list[i].dir);
+		list[i].exists = st != null;
+	}
+	return list;
+}
+
+function hiddenServiceAdd(args) {
+	const name = trim(args?.name ?? '');
+	if (!match(name, /^[a-zA-Z0-9_-]{1,32}$/))
+		return { ok: false, message: 'Имя сервиса: только латиница, цифры, "-" и "_" (до 32 символов).' };
+
+	const ports = args?.ports ?? [];
+	const portLines = [];
+	for (let i = 0; i < length(ports); i++) {
+		const vport = trim(ports[i].vport ?? '');
+		const target = trim(ports[i].target ?? '');
+		if (!match(vport, /^[0-9]{1,5}$/) || +vport < 1 || +vport > 65535)
+			return { ok: false, message: `Неверный виртуальный порт: ${vport}` };
+		if (length(target) && !match(target, /^[A-Za-z0-9._:-]+$/))
+			return { ok: false, message: `Неверный адрес назначения: ${target}` };
+		push(portLines, `HiddenServicePort ${vport}${length(target) ? ' ' + target : ''}`);
+	}
+	if (!length(portLines))
+		return { ok: false, message: 'Добавьте хотя бы один порт.' };
+
+	const dir = `${TOR_DATA}/hs-${name}`;
+	const block = [`HiddenServiceDir ${dir}`];
+	for (let i = 0; i < length(portLines); i++)
+		push(block, portLines[i]);
+
+	const content = torrcRead();
+	const updated = rewriteDirectives(content, [
+		{ name: 'HiddenServiceDir', lines: [] },
+		{ name: 'HiddenServicePort', lines: [] }
+	]);
+
+	// rebuild: existing hidden services + the new one
+	const existing = hiddenServices();
+	const keep = [];
+	for (let i = 0; i < length(existing); i++) {
+		if (existing[i].dir == dir)
+			continue;
+		push(keep, `HiddenServiceDir ${existing[i].dir}`);
+		for (let j = 0; j < length(existing[i].ports); j++)
+			push(keep, `HiddenServicePort ${existing[i].ports[j].vport}${length(existing[i].ports[j].target) ? ' ' + existing[i].ports[j].target : ''}`);
+	}
+
+	for (let i = 0; i < length(block); i++)
+		push(keep, block[i]);
+
+	const merged = rewriteDirectives(updated, [
+		{ name: 'HiddenServiceDir', lines: keep }
+	]);
+
+	const ver = verifyTorrc(merged);
+	if (!ver.ok)
+		return { ok: false, message: ver.message };
+
+	backupTorrc();
+	writeAtomic(TORRC, merged, '600');
+	ensureDir(dir, 0o700);
+	if (exists('/etc/init.d/tor'))
+		sh('/etc/init.d/tor restart >/dev/null 2>&1');
+
+	let hostname = '';
+	for (let i = 0; i < 20; i++) {
+		sleep(500);
+		hostname = trim(readText(`${dir}/hostname`));
+		if (length(hostname))
+			break;
+	}
+
+	/* tor already stores the full .onion name in the hostname file */
+	return { ok: true, message: 'Скрытый сервис добавлен.', hostname, onion: hostname };
+}
+
+function hiddenServiceDel(args) {
+	const dir = trim(args?.dir ?? '');
+	if (!match(dir, /^\/var\/lib\/tor\/[A-Za-z0-9_\/-]+$/))
+		return { ok: false, message: 'Некорректный каталог сервиса.' };
+
+	const services = hiddenServices();
+	const keep = [];
+	let removed = false;
+
+	for (let i = 0; i < length(services); i++) {
+		if (services[i].dir == dir) {
+			removed = true;
+			continue;
+		}
+		push(keep, `HiddenServiceDir ${services[i].dir}`);
+		for (let j = 0; j < length(services[i].ports); j++)
+			push(keep, `HiddenServicePort ${services[i].ports[j].vport}${length(services[i].ports[j].target) ? ' ' + services[i].ports[j].target : ''}`);
+	}
+
+	if (!removed)
+		return { ok: false, message: 'Сервис не найден.' };
+
+	const content = rewriteDirectives(torrcRead(), [
+		{ name: 'HiddenServiceDir', lines: [] },
+		{ name: 'HiddenServicePort', lines: [] }
+	]);
+	const merged = rewriteDirectives(content, [
+		{ name: 'HiddenServiceDir', lines: keep }
+	]);
+
+	backupTorrc();
+	writeAtomic(TORRC, merged, '600');
+	if (args?.purge)
+		sh(`rm -rf ${shq(dir)}`);
+	sh('/etc/init.d/tor restart >/dev/null 2>&1');
+
+	return { ok: true, message: 'Скрытый сервис удалён.' };
+}
+
+/* ------------------------------------------------------------------ */
+/* traffic monitor                                                     */
+/* ------------------------------------------------------------------ */
+
+function inList(list, value) {
+	for (let i = 0; i < length(list); i++)
+		if (list[i] == value)
+			return true;
+	return false;
+}
+
+function privateAddress(ip) {
+	return match(ip ?? '', /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/);
+}
+
+/* Parse /proc/net/nf_conntrack and return the connections of the clients
+ * that are proxied through Tor. */
+function trafficConnections() {
+	const out = [];
+	const raw = readText('/proc/net/nf_conntrack');
+
+	if (!length(raw))
+		return out;
+
+	const state = proxyState();
+	const clients = state.clients;
+
+	const lines = split(raw, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const t = trim(lines[i]);
+		if (!length(t))
+			continue;
+
+		const parts = split(t, /[ \t]+/);
+		const proto = parts[2] ?? '';
+		const timeout = +(parts[4] ?? 0);
+
+		let src = '', dst = '', dport = '', sport = '';
+		let packets = 0, bytes = 0;
+		let seenSrc = false;
+
+		for (let j = 0; j < length(parts); j++) {
+			const p = parts[j];
+
+			if (substr(p, 0, 8) == 'packets=') {
+				if (!packets)
+					packets = +(substr(p, 8) ?? 0);
+				continue;
+			}
+			if (substr(p, 0, 6) == 'bytes=') {
+				if (!bytes)
+					bytes = +(substr(p, 6) ?? 0);
+				continue;
+			}
+
+			if (substr(p, 0, 4) == 'src=') {
+				if (!seenSrc) {
+					src = substr(p, 4);
+					seenSrc = true;
+				}
+				continue;
+			}
+			if (substr(p, 0, 4) == 'dst=') {
+				if (!dst)
+					dst = substr(p, 4);
+				continue;
+			}
+			if (substr(p, 0, 6) == 'dport=') {
+				if (!dport)
+					dport = substr(p, 6);
+				continue;
+			}
+			if (substr(p, 0, 6) == 'sport=') {
+				if (!sport)
+					sport = substr(p, 6);
+				continue;
+			}
+		}
+
+		/* udp entries have no state field, the token after the timeout
+		 * belongs to the reply direction */
+		const st = (proto == 'udp') ? '' : (parts[5] ?? '');
+		const active = (st == 'ESTABLISHED' || st == 'SYN_SENT' || st == 'SYN_RECV' || proto == 'udp');
+
+		if (!length(src) || !length(dst))
+			continue;
+		if (!privateAddress(src))
+			continue;
+
+		let proxied = false;
+		for (let j = 0; j < length(clients); j++) {
+			const c = trim(clients[j]);
+			if (c == src || (index(c, '/') > -1 && index(src, substr(c, 0, index(c, '/'))) == 0))
+				proxied = true;
+		}
+
+		push(out, {
+			proto,
+			src,
+			sport,
+			dst,
+			dport,
+			state: st,
+			timeout,
+			packets,
+			bytes,
+			active,
+			proxied
+		});
+	}
+
+	return out;
+}
+
+/* Delete the conntrack entries of a client (or of a single destination). */
+function trafficClose(client, dst, dport) {
+	const conns = trafficConnections();
+	let removed = 0;
+	const lines = [];
+
+	for (let i = 0; i < length(conns); i++) {
+		const c = conns[i];
+		if (client && c.src != client)
+			continue;
+		if (dst && c.dst != dst)
+			continue;
+		if (dport && c.dport != dport)
+			continue;
+		push(lines, c);
+	}
+
+	if (!length(lines))
+		return { ok: true, removed: 0, message: 'Подходящих соединений не найдено.' };
+
+	/* conntrack -D removes the entries; without the tool we can only
+	 * report that the connections have to be closed by the client. */
+	const tool = exists('/usr/sbin/conntrack') ? '/usr/sbin/conntrack'
+		: (exists('/usr/bin/conntrack') ? '/usr/bin/conntrack' : null);
+
+	if (!tool)
+		return {
+			ok: false,
+			removed: 0,
+			message: 'Установите пакет conntrack (apk add conntrack), чтобы закрывать соединения.'
+		};
+
+	for (let i = 0; i < length(lines); i++) {
+		const c = lines[i];
+		const cmd = `conntrack -D -p ${c.proto} -s ${c.src} -d ${c.dst} --dport ${c.dport} 2>/dev/null`;
+		sh(cmd);
+		removed++;
+	}
+
+	return { ok: true, removed, message: `Закрыто соединений: ${removed}.` };
+}
+
+function trafficResolve(ip) {
+	if (!match(ip ?? '', /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/))
+		return { ip, name: '' };
+
+	const out = trim(sh(`nslookup ${ip} 2>/dev/null | sed -n 's/^Name:[[:space:]]*//p' | head -1`));
+	return { ip, name: out };
+}
+
+/* ------------------------------------------------------------------ */
+/* public RPC methods                                                  */
+/* ------------------------------------------------------------------ */
+
+function rmSafe(path) {
+	sh(`rm -f ${shq(path)}`);
+}
+
+const methods = {
+	status: {
+		call: function() {
+			return fullStatus();
+		}
+	},
+
+	action: {
+		args: { cmd: 'status' },
+		call: function(req) {
+			const cmd = req.args?.cmd ?? '';
+			if (index(['start', 'stop', 'restart', 'reload', 'enable', 'disable'], cmd) < 0)
+				return { ok: false, message: 'Unknown action' };
+
+			const out = trim(sh(`/etc/init.d/tor ${cmd} 2>&1`));
+			if (cmd == 'start' || cmd == 'restart')
+				for (let i = 0; i < 20; i++) {
+					sleep(500);
+					if (serviceStatus().running)
+						break;
+				}
+			return { ok: true, message: out || `tor ${cmd}: ok`, status: serviceStatus() };
+		}
+	},
+
+	torrcGet: {
+		call: function() {
+			const st = stat(TORRC);
+			return {
+				ok: true,
+				path: TORRC,
+				content: torrcRead(),
+				size: st?.size ?? 0,
+				mtime: st?.mtime ?? 0
+			};
+		}
+	},
+
+	torrcVerify: {
+		args: { content: '' },
+		call: function(req) {
+			return verifyTorrc(req.args?.content ?? '');
+		}
+	},
+
+	torrcSave: {
+		args: { content: '', restart: true },
+		call: function(req) {
+			const content = req.args?.content ?? '';
+			const ver = verifyTorrc(content);
+			if (!ver.ok)
+				return { ok: false, message: ver.message };
+
+			const backup = backupTorrc();
+			if (!writeAtomic(TORRC, content, '600'))
+				return { ok: false, message: 'Не удалось записать torrc.' };
+
+			if (req.args?.restart !== false)
+				sh('/etc/init.d/tor restart >/dev/null 2>&1');
+
+			return { ok: true, message: 'torrc сохранён' + (backup ? ` (резервная копия: ${backup})` : ''), backup };
+		}
+	},
+
+	backups: {
+		call: function() {
+			ensureDir(BACKUP_DIR, 0o700);
+			const files = backupList();
+			const out = [];
+			for (let i = 0; i < length(files); i++) {
+				const st = stat(`${BACKUP_DIR}/${files[i]}`);
+				push(out, { name: files[i], size: st?.size ?? 0, mtime: st?.mtime ?? 0 });
+			}
+			sort(out, (a, b) => b.mtime - a.mtime);
+			return { ok: true, backups: out, keep: backupKeep() };
+		}
+	},
+
+	backupRestore: {
+		args: { name: '' },
+		call: function(req) {
+			const name = req.args?.name ?? '';
+			if (!match(name, /^torrc\.[0-9-]+$/))
+				return { ok: false, message: 'Некорректное имя резервной копии.' };
+			const src = `${BACKUP_DIR}/${name}`;
+			if (!exists(src))
+				return { ok: false, message: 'Файл не найден.' };
+			const content = readText(src);
+			if (!length(content))
+				return { ok: false, message: 'Пустая резервная копия.' };
+			backupTorrc();
+			writeAtomic(TORRC, content, '600');
+			sh('/etc/init.d/tor restart >/dev/null 2>&1');
+			return { ok: true, message: `Восстановлено из ${name}` };
+		}
+	},
+
+	/* remove one backup or all of them */
+	backupDelete: {
+		args: { name: '', all: false },
+		call: function(req) {
+			if (req.args?.all) {
+				const files = backupList();
+				let n = 0;
+				for (let i = 0; i < length(files); i++) {
+					if (unlink(`${BACKUP_DIR}/${files[i]}`) == 0)
+						n++;
+				}
+				return { ok: true, removed: n, message: `Удалено резервных копий: ${n}.` };
+			}
+
+			const name = trim(req.args?.name ?? '');
+			if (!match(name, /^torrc\.[0-9]{8}-[0-9]{6}$/))
+				return { ok: false, message: 'Некорректное имя резервной копии.' };
+
+			if (!exists(`${BACKUP_DIR}/${name}`))
+				return { ok: false, message: 'Файл не найден.' };
+
+			unlink(`${BACKUP_DIR}/${name}`);
+			return { ok: true, removed: 1, message: `Резервная копия ${name} удалена.` };
+		}
+	},
+
+	/* how many backups are kept */
+	backupKeepSet: {
+		args: { keep: 20 },
+		call: function(req) {
+			let keep = +(req.args?.keep ?? 20);
+			if (keep < 1)
+				keep = 1;
+			if (keep > 100)
+				keep = 100;
+
+			uciApply([['backup', 'keep', sprintf('%d', keep)]]);
+
+			/* apply the new limit right away */
+			const files = backupList();
+			let removed = 0;
+			while (length(files) > keep) {
+				unlink(`${BACKUP_DIR}/${shift(files)}`);
+				removed++;
+			}
+
+			return {
+				ok: true,
+				keep,
+				removed,
+				message: `Хранится последних копий: ${keep}.` + (removed ? ` Удалено лишних: ${removed}.` : '')
+			};
+		}
+	},
+
+	bridgesGet: {
+		call: function() {
+			const st = bridgesState();
+			st.ok = true;
+			return st;
+		}
+	},
+
+	bridgesSave: {
+		args: { bridges: [], restart: true, revision: '', force: false },
+		call: function(req) {
+			const list = req.args?.bridges ?? [];
+
+			/* the torrc may have been changed by hand since the list was
+			 * loaded - warn before the manual bridges are overwritten */
+			const rev = trim(req.args?.revision ?? '');
+			if (rev && rev != torrcRevision() && !req.args?.force) {
+				return {
+					ok: false,
+					conflict: true,
+					message: 'Файл /etc/tor/torrc изменён вне приложения. ' +
+						'Нажмите «Обновить из файла», чтобы увидеть актуальные мосты, ' +
+						'либо сохраните с принудительной перезаписью.'
+				};
+			}
+
+			const cand = bridgeCandidate(list);
+
+			const changes = [
+				{ name: 'UseBridges', lines: length(cand.bridges) ? ['UseBridges 1'] : [] },
+				{ name: 'ClientTransportPlugin', lines: cand.plugin },
+				{ name: 'Bridge', lines: cand.bridges }
+			];
+
+			const updated = rewriteDirectives(torrcRead(), changes);
+			const ver = verifyTorrc(updated);
+			if (!ver.ok)
+				return { ok: false, message: ver.message };
+
+			backupTorrc();
+			writeAtomic(TORRC, updated, '600');
+
+			if (req.args?.restart !== false)
+				sh('/etc/init.d/tor restart >/dev/null 2>&1');
+
+			return {
+				ok: true,
+				message: length(cand.bridges)
+					? `Сохранено мостов: ${length(cand.bridges)}.` + (req.args?.restart !== false ? ' Tor перезапущен.' : '')
+					: 'Мосты удалены, Tor будет подключаться напрямую.'
+			};
+		}
+	},
+
+	/* start an isolated test for the given list of bridges */
+	bridgesTest: {
+		args: { bridges: [] },
+		call: function(req) {
+			const cand = bridgeCandidate(req.args?.bridges ?? []);
+
+			if (!length(cand.bridges))
+				return { ok: false, message: 'Не выбрано ни одного моста для проверки.' };
+
+			ensureDir(`${STATE}/test`, 0o755);
+			sh(`test -f ${STATE}/test/pid && kill $(cat ${STATE}/test/pid) 2>/dev/null; pkill -f test-bridges 2>/dev/null`);
+			rmSafe(`${STATE}/test/state`);
+			rmSafe(`${STATE}/test/guards`);
+			rmSafe(`${STATE}/test/log`);
+			rmSafe(`${STATE}/test/line`);
+
+			const candLines = [];
+			for (let i = 0; i < length(cand.plugin); i++) {
+				/* each transport logs on its own, keep the output for the ui */
+				let pl = cand.plugin[i];
+				if (index(pl, 'lyrebird') >= 0)
+					pl = pl + ' -enableLogging -logLevel INFO';
+				else if (index(pl, 'snowflake-client') >= 0)
+					pl = pl + ' -log /tmp/tor-ext/test/sf.log';
+				push(candLines, pl);
+			}
+			for (let i = 0; i < length(cand.bridges); i++)
+				push(candLines, cand.bridges[i]);
+
+			writefile(`${STATE}/test/candidate.conf`, join('\n', candLines) + '\n');
+			writefile(`${STATE}/test/line`, join('\n', cand.bridges) + '\n');
+
+			popen('/usr/libexec/tor-ext/test-bridges >/dev/null 2>&1 &');
+			sleep(500);
+
+			return { ok: true, started: true, message: 'Проверка запущена (до 2 минут).' };
+		}
+	},
+
+	/* test a single bridge (used by the per bridge check button) */
+	bridgeTestStart: {
+		args: { type: 'obfs4', line: '' },
+		call: function(req) {
+			const type = req.args?.type ?? 'vanilla';
+			const line = trim(req.args?.line ?? '');
+
+			if (!length(line))
+				return { ok: false, message: 'Пустая строка моста.' };
+
+			const info = transportInfo(type);
+			if (info && !info.installed && type != 'vanilla')
+				return { ok: false, message: `Транспорт ${info.label} не установлен на роутере.` };
+
+			const cand = bridgeCandidate([{ type: type, line: line }]);
+
+			ensureDir(`${STATE}/test`, 0o755);
+			sh(`test -f ${STATE}/test/pid && kill $(cat ${STATE}/test/pid) 2>/dev/null; pkill -f test-bridges 2>/dev/null`);
+			rmSafe(`${STATE}/test/state`);
+			rmSafe(`${STATE}/test/guards`);
+			rmSafe(`${STATE}/test/log`);
+
+			const candLines = [];
+			for (let i = 0; i < length(cand.plugin); i++) {
+				/* each transport logs on its own, keep the output for the ui */
+				let pl = cand.plugin[i];
+				if (index(pl, 'lyrebird') >= 0)
+					pl = pl + ' -enableLogging -logLevel INFO';
+				else if (index(pl, 'snowflake-client') >= 0)
+					pl = pl + ' -log /tmp/tor-ext/test/sf.log';
+				push(candLines, pl);
+			}
+			for (let i = 0; i < length(cand.bridges); i++)
+				push(candLines, cand.bridges[i]);
+
+			writefile(`${STATE}/test/candidate.conf`, join('\n', candLines) + '\n');
+			writefile(`${STATE}/test/line`, `Bridge ${line}\n`);
+
+			popen('/usr/libexec/tor-ext/test-bridges >/dev/null 2>&1 &');
+			sleep(500);
+
+			return { ok: true, started: true, type, line, message: 'Проверка моста запущена.' };
+		}
+	},
+
+	bridgesTestStatus: {
+		call: function() {
+			const stateRaw = trim(readText(`${STATE}/test/state`));
+			const parts = split(stateRaw, /[ \t]+/);
+			const status = parts[0] || 'idle';
+			const percent = +(parts[1] ?? 0);
+			const phase = parts[2] ?? '';
+
+			const rawGuards = parseCtl(readText(`${STATE}/test/guards`))['entry-guards'] ?? '';
+			const guards = parseGuards(rawGuards);
+			const bridgeGuards = [];
+			for (let i = 0; i < length(guards); i++)
+				push(bridgeGuards, guards[i]);
+
+			const logTail = trim(sh(`tail -n 25 ${STATE}/test/log 2>/dev/null`));
+			const errTail = trim(sh(`tail -n 25 ${STATE}/test/err 2>/dev/null`));
+			const lyreLog = trim(sh(`tail -n 25 ${STATE}/test/data/pt_state/lyrebird.log 2>/dev/null`));
+			const candidate = trim(readText(`${STATE}/test/candidate.conf`));
+			const tested = trim(readText(`${STATE}/test/line`));
+
+			return {
+				ok: true, status, percent, phase, guards: bridgeGuards,
+				log: logTail,
+				err: (lyreLog ? lyreLog : errTail),
+				candidate, tested
+			};
+		}
+	},
+
+	portsGet: {
+		call: function() {
+			const torrc = torrcRead();
+			return {
+				ok: true,
+				socks: directiveFirst(torrc, 'SocksPort', '9050'),
+				trans: directiveFirst(torrc, 'TransPort', '9040'),
+				dns: directiveFirst(torrc, 'DNSPort', '9053'),
+				control: directiveFirst(torrc, 'ControlPort', '9051'),
+				listeners: {
+					socks: directiveValues(torrc, 'SocksPort'),
+					trans: directiveValues(torrc, 'TransPort'),
+					dns: directiveValues(torrc, 'DNSPort'),
+					control: directiveValues(torrc, 'ControlPort')
+				},
+				hidden_services: hiddenServices()
+			};
+		}
+	},
+
+	portsSave: {
+		args: { socks: '9050', trans: '9040', dns: '9053', control: '9051', lan: false, restart: true },
+		call: function(req) {
+			const a = req.args ?? {};
+			const mk = (k, def) => {
+				const v = trim(a[k] ?? def);
+				const port = match(v, /^([0-9]{1,5})$/) ? v : (match(v, /^[0-9.]+:([0-9]{1,5})$/) ?? [])[1];
+				if (!port || +port < 1 || +port > 65535)
+					return null;
+				return a.lan ? `0.0.0.0:${port}` : `127.0.0.1:${port}`;
+			};
+
+			/* the control port stays on localhost only, it is protected by the
+			 * cookie authentication and must not be reachable from the network */
+			const mkLocal = (k, def) => {
+				const v = trim(a[k] ?? def);
+				const port = match(v, /^([0-9]{1,5})$/) ? v : (match(v, /^[0-9.]+:([0-9]{1,5})$/) ?? [])[1];
+				if (!port || +port < 1 || +port > 65535)
+					return null;
+				return `127.0.0.1:${port}`;
+			};
+
+			const socks = mk('socks', '9050');
+			const trans = mk('trans', '9040');
+			const dns = mk('dns', '9053');
+			const control = mkLocal('control', '9051');
+			if (!socks || !trans || !dns || !control)
+				return { ok: false, message: 'Порты должны быть числами 1-65535.' };
+
+			const updated = rewriteDirectives(torrcRead(), [
+				{ name: 'SocksPort', lines: [`SocksPort ${socks}`] },
+				{ name: 'TransPort', lines: [`TransPort ${trans}`] },
+				{ name: 'DNSPort', lines: [`DNSPort ${dns}`] },
+				{ name: 'ControlPort', lines: [`ControlPort ${control}`] },
+				{ name: 'CookieAuthentication', lines: ['CookieAuthentication 1'] }
+			]);
+			const ver = verifyTorrc(updated);
+			if (!ver.ok)
+				return { ok: false, message: ver.message };
+
+			backupTorrc();
+			writeAtomic(TORRC, updated, '600');
+			if (a.restart !== false)
+				sh('/etc/init.d/tor restart >/dev/null 2>&1');
+
+			// re-apply proxy rules so they point at the new ports
+			sh('/usr/libexec/tor-ext/apply-proxy apply >/dev/null 2>&1');
+			return { ok: true, message: 'Порты сохранены.' };
+		}
+	},
+
+	hsAdd: {
+		args: { name: '', ports: [], restart: true },
+		call: function(req) {
+			return hiddenServiceAdd(req.args ?? {});
+		}
+	},
+
+	hsDel: {
+		args: { dir: '', purge: false },
+		call: function(req) {
+			return hiddenServiceDel(req.args ?? {});
+		}
+	},
+
+	proxyGet: {
+		call: function() {
+			const st = proxyState();
+			st.ok = true;
+			return st;
+		}
+	},
+
+	proxyPreview: {
+		call: function() {
+			sh('/usr/libexec/tor-ext/apply-proxy generate >/dev/null 2>&1');
+			let rules = readText('/tmp/tor-ext-proxy.nft');
+			if (!length(trim(rules)))
+				rules = '# правила не сформированы: проксирование выключено или не заданы клиенты';
+			return { ok: true, rules };
+		}
+	},
+
+	proxySave: {
+		args: {
+			enabled: false, mode: 'clients', clients: [],
+			redirect_dns: true, redirect_tcp: true,
+			killswitch: true, block_ipv6: true,
+			block_quic: true, block_dot: true,
+			router_traffic: false
+		},
+		call: function(req) {
+			proxySaveArgs(req.args ?? {});
+			const ok = sh('/usr/libexec/tor-ext/apply-proxy apply 2>&1; echo "rc=$?"');
+			const rc = (match(ok, /rc=([0-9]+)/) ?? [])[1];
+			const state = proxyState();
+			if (rc != '0')
+				return { ok: false, message: 'Правила не применены: проверьте список клиентов.', state };
+			return {
+				ok: true,
+				message: state.enabled ? 'Прозрачное проксирование включено.' : 'Прозрачное проксирование выключено.',
+				state
+			};
+		}
+	},
+
+	/* list the connections that are going through the transparent proxy */
+	trafficGet: {
+		call: function() {
+			const conns = trafficConnections();
+			const state = proxyState();
+
+			/* all clients that are seen in the connection table */
+			const seen = [];
+			for (let i = 0; i < length(conns); i++) {
+				if (!inList(seen, conns[i].src))
+					push(seen, conns[i].src);
+			}
+
+			/* per client counters */
+			const stats = [];
+			for (let i = 0; i < length(seen); i++) {
+				let count = 0;
+				for (let j = 0; j < length(conns); j++)
+					if (conns[j].src == seen[i])
+						count++;
+				push(stats, { ip: seen[i], connections: count, proxied: inList(state.clients, seen[i]) });
+			}
+
+			return {
+				ok: true,
+				enabled: state.enabled,
+				mode: state.mode,
+				clients: state.clients,
+				sources: stats,
+				connections: conns,
+				total: length(conns)
+			};
+		}
+	},
+
+	/* close the connections of a client or of a single destination */
+	trafficClose: {
+		args: { client: '', dst: '', dport: '' },
+		call: function(req) {
+			const a = req.args ?? {};
+			return trafficClose(trim(a.client ?? ''), trim(a.dst ?? ''), trim(a.dport ?? ''));
+		}
+	},
+
+	/* resolve a single address to a host name (called from the UI) */
+	trafficResolve: {
+		args: { ip: '' },
+		call: function(req) {
+			return trafficResolve(req.args?.ip ?? '');
+		}
+	},
+
+	logs: {
+		args: { source: 'file', lines: 200 },
+		call: function(req) {
+			const source = req.args?.source ?? 'file';
+			const count = min(max(+(req.args?.lines ?? 200), 20), 2000);
+			let content = '';
+
+			if (source == 'syslog')
+				content = sh(`logread -e tor | tail -n ${count} 2>/dev/null`);
+			else if (source == 'ext')
+				content = sh(`logread -e tor-ext | tail -n ${count} 2>/dev/null`);
+			else
+				content = sh(`tail -n ${count} ${TOR_LOG} 2>/dev/null`);
+
+			if (!length(trim(content)))
+				content = '(пусто)';
+
+			return { ok: true, source, content };
+		}
+	},
+
+	checkIp: {
+		args: { force: false },
+		call: function(req) {
+			return ipCheckCached(req.args?.force === true);
+		}
+	},
+
+	settingsGet: {
+		call: function() {
+			return {
+				ok: true,
+				watchdog_enabled: uciGet('watchdog.enabled', '1') == '1',
+				auto_restart: uciGet('watchdog.auto_restart', '1') == '1',
+				notify_enabled: uciGet('notify.enabled', '0') == '1',
+				telegram_token: uciGet('notify.telegram_token', ''),
+				telegram_chat: uciGet('notify.telegram_chat', ''),
+				webhook: uciGet('notify.webhook', '')
+			};
+		}
+	},
+
+	settingsSave: {
+		args: {
+			watchdog_enabled: true, auto_restart: true,
+			notify_enabled: false, telegram_token: '',
+			telegram_chat: '', webhook: ''
+		},
+		call: function(req) {
+			const a = req.args ?? {};
+			uciApply([
+				['watchdog', 'enabled', a.watchdog_enabled ? '1' : '0'],
+				['watchdog', 'auto_restart', a.auto_restart ? '1' : '0'],
+				['notify', 'enabled', a.notify_enabled ? '1' : '0'],
+				['notify', 'telegram_token', trim(a.telegram_token ?? '')],
+				['notify', 'telegram_chat', trim(a.telegram_chat ?? '')],
+				['notify', 'webhook', trim(a.webhook ?? '')]
+			]);
+			sh('/etc/init.d/cron reload >/dev/null 2>&1');
+			return { ok: true, message: 'Настройки сохранены.' };
+		}
+	},
+
+	settingsTest: {
+		call: function() {
+			const out = trim(sh('/usr/libexec/tor-ext/notify "Тестовое уведомление luci-app-tor-ext" 2>&1'));
+			return { ok: true, message: out || 'Уведомление отправлено (см. syslog).' };
+		}
+	}
+};
+
+
+// Wrap every method so that internal errors are reported to the UI
+// instead of breaking the whole ubus call. ucode does not hoist function
+// declarations and captures loop variables, hence the explicit factory.
+function wrapMethod(mname, method) {
+	return {
+		args: method.args,
+		call: function(req) {
+			try {
+				return method.call(req);
+			}
+			catch (e) {
+				return { ok: false, message: 'Внутренняя ошибка: ' + e, method: mname };
+			}
+		}
+	};
+}
+
+const exported = {};
+
+for (let mname, method in methods)
+	exported[mname] = wrapMethod(mname, method);
+
+return { 'tor-ext': exported };
