@@ -1155,6 +1155,7 @@ function splitState() {
 		block_dot: uciGet('split.block_dot', '1') == '1',
 		interval: uciGet('split.interval', '6h'),
 		clients: uciShowList('split.client'),
+		full_clients: uciGet('proxy.enabled', '0') == '1' ? uciShowList('proxy.client') : [],
 		lists: enabledLists,
 		custom_domains: uciShowList('split.custom_domains'),
 		custom_subnets: uciShowList('split.custom_subnets'),
@@ -1184,15 +1185,33 @@ function splitValidSubnet(s) {
 }
 
 function splitSaveArgs(args) {
-	const clients = [];
+	const splitSet = [];	/* devices: only the domains of the lists go via Tor */
+	const fullSet = [];	/* devices: all traffic except local via Tor */
 	const lists = args.lists ?? [];
 	const domains = args.custom_domains ?? [];
 	const subnets = args.custom_subnets ?? [];
 
-	for (let i = 0; i < length(args.clients ?? []); i++) {
-		const c = trim(args.clients[i]);
-		if (match(c, /^[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]{1,2})?$/))
-			push(clients, c);
+	const validAddr = (s) => match(trim(s ?? ''), /^[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]{1,2})?$/);
+
+	/* only the addresses are collected into both sets at once */
+	const rawAddrs = [];
+	for (let i = 0; i < length(args.clients ?? []); i++)
+		push(rawAddrs, ['split', trim(args.clients[i])]);
+	for (let i = 0; i < length(args.full_clients ?? []); i++)
+		push(rawAddrs, ['full', trim(args.full_clients[i])]);
+
+	/* a device can be in only one of the modes */
+	for (let i = 0; i < length(rawAddrs); i++) {
+		const kind = rawAddrs[i][0];
+		const addr = rawAddrs[i][1];
+		if (!validAddr(addr))
+			continue;
+		if (inList(splitSet, addr) || inList(fullSet, addr))
+			continue;
+		if (kind == 'full')
+			push(fullSet, addr);
+		else
+			push(splitSet, addr);
 	}
 
 	const cleanLists = [];
@@ -1221,10 +1240,13 @@ function splitSaveArgs(args) {
 		['split', 'block_quic', args.block_quic !== false ? '1' : '0'],
 		['split', 'block_dot', args.block_dot !== false ? '1' : '0'],
 		['split', 'interval', index(['1h', '6h', '12h', '24h'], trim(args.interval ?? '6h')) >= 0 ? trim(args.interval) : '6h'],
-		['split', 'client', length(clients) ? clients : null],
+		['split', 'client', length(splitSet) ? splitSet : null],
 		['split', 'lists', length(cleanLists) ? cleanLists : null],
 		['split', 'custom_domains', length(cleanDomains) ? cleanDomains : null],
-		['split', 'custom_subnets', length(cleanSubnets) ? cleanSubnets : null]
+		['split', 'custom_subnets', length(cleanSubnets) ? cleanSubnets : null],
+		['proxy', 'client', length(fullSet) ? fullSet : null],
+		/* the full tunnel is combined per device: enabled if at least one device is present */
+		['proxy', 'enabled', length(fullSet) ? '1' : '0']
 	]);
 }
 
@@ -1690,7 +1712,7 @@ const methods = {
 	splitSave: {
 		args: {
 			enabled: false, mode: 'proxy', scope: 'clients',
-			clients: [], lists: [],
+			clients: [], full_clients: [], lists: [],
 			custom_domains: [], custom_subnets: [],
 			block_quic: true, block_dot: true,
 			interval: '6h'
@@ -1704,8 +1726,8 @@ const methods = {
 				hasList = hasList || length(a.custom_domains ?? []) || length(a.custom_subnets ?? []);
 				if (!hasList)
 					return { ok: false, message: 'Включите хотя бы один список или добавьте свои домены/подсети.' };
-				if ((a.scope ?? 'clients') == 'clients' && !length(a.clients ?? []))
-					return { ok: false, message: 'Для режима "выбранные устройства" укажите IP клиентов.' };
+				if ((a.scope ?? 'clients') == 'clients' && !length(a.clients ?? []) && !length(a.full_clients ?? []))
+					return { ok: false, message: 'Отметьте хотя бы одно устройство.' };
 			}
 
 			splitSaveArgs(a);

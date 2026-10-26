@@ -9,7 +9,7 @@
 var callGet = rpc.declare({ object: 'tor-ext', method: 'splitGet' });
 var callSave = rpc.declare({
 	object: 'tor-ext', method: 'splitSave',
-	params: ['enabled', 'mode', 'scope', 'clients', 'lists', 'custom_domains', 'custom_subnets', 'block_quic', 'block_dot', 'interval']
+	params: ['enabled', 'mode', 'scope', 'clients', 'full_clients', 'lists', 'custom_domains', 'custom_subnets', 'block_quic', 'block_dot', 'interval']
 });
 var callUpdate = rpc.declare({ object: 'tor-ext', method: 'splitUpdate' });
 var callResolve = rpc.declare({ object: 'tor-ext', method: 'splitResolve' });
@@ -57,11 +57,14 @@ return view.extend({
 		this.listBox = E('div', {}, this.renderLists(s));
 		this.counterBox = E('div', { 'id': 'tx-split-counters' }, this.renderCounters(s));
 
-		/* devices: checkbox selection from DHCP leases + manual additions */
+		/* devices: mode selection (split/full) from DHCP leases + manual add */
 		this.leases = leases;
-		this.manualClients = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '192.168.1.100', 'style': 'width:180px' });
+		this.manualClients = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '192.168.1.100', 'style': 'width:160px' });
+		this.manualMode = E('select', { 'class': 'cbi-input-select', 'style': 'width:190px' }, [
+			E('option', { 'value': 'split' }, 'Раздельно'),
+			E('option', { 'value': 'full' }, 'Весь трафик')
+		]);
 		this.deviceBox = E('div', {});
-		this.manualBox = E('div', { 'class': 'tx-muted', 'style': 'margin-top:6px' });
 
 		var page = E('div', { 'class': 'tx-page' }, [
 			TX.style(),
@@ -83,13 +86,16 @@ return view.extend({
 
 			TX.card('Устройства', [
 				E('div', { 'class': 'tx-row' }, [E('label', {}, 'Кому применять'), this.scope]),
+				E('div', { 'class': 'tx-muted' },
+					'«Раздельно» — через Tor идут только домены и подсети из списков. ' +
+					'«Весь трафик» — через Tor идёт всё, кроме локальной сети (killswitch: при остановке Tor интернет у устройства блокируется).'),
 				this.deviceBox,
 				E('div', { 'class': 'tx-row', 'style': 'margin-top:8px' }, [
 					E('label', { 'class': 'tx-muted', 'style': 'margin:0' }, 'Добавить вручную:'),
 					this.manualClients,
+					this.manualMode,
 					TX.btn('Добавить', 'action', function() { return self.addManual(); })
-				]),
-				this.manualBox
+				])
 			]),
 
 			TX.card('Списки', [this.listBox]),
@@ -177,56 +183,80 @@ return view.extend({
 
 	renderDeviceList: function() {
 		var self = this;
-		var all = this.scope.value === 'all';
-		var selected = (this.state ? (this.state.clients || []) : []).slice();
-		/* keep manually added entries that are not in leases */
+		if (this.scope.value === 'all') {
+			dom.content(this.deviceBox, [
+				E('div', { 'class': 'tx-muted' }, 'Правила применяются ко всем устройствам LAN.')
+			]);
+			return;
+		}
+
 		var leaseIPs = {};
-		(this.leases || []).forEach(function(l) { leaseIPs[self.leaseIP(l)] = self.leaseIP(l); });
-		this.extraClients = (selected || []).filter(function(ip) {
-			return !leaseIPs[ip];
+		(this.leases || []).forEach(function(l) { leaseIPs[self.leaseIP(l)] = true; });
+
+		var rows = [];
+		(this.leases || []).slice(0, 60).forEach(function(l) {
+			rows.push(self.deviceRow(self.leaseIP(l), l.hostname || l.macaddr || ''));
 		});
 
-		dom.content(this.deviceBox, all ? [
-			E('div', { 'class': 'tx-muted' }, 'Правила применяются ко всем устройствам LAN.')
-		] : [
-			E('div', { 'class': 'tx-muted', 'style': 'margin-bottom:6px' }, 'Отметьте устройства из аренд DHCP:'),
-			(this.leases && this.leases.length) ?
-				E('div', {}, this.leases.slice(0, 60).map(function(l) {
-					return self.deviceRow(l);
-				}))
-				: E('div', { 'class': 'tx-muted' }, 'Аренды DHCP не найдены — добавьте IP вручную.')
-		]);
+		/* manual entries that are not in the leases */
+		var seen = {}, extras = [];
+		((this.state && this.state.clients) || []).forEach(function(ip) {
+			if (!leaseIPs[ip] && !seen[ip]) { seen[ip] = 1; extras.push(ip); }
+		});
+		((this.state && this.state.full_clients) || []).forEach(function(ip) {
+			if (!leaseIPs[ip] && !seen[ip]) { seen[ip] = 1; extras.push(ip); }
+		});
+		extras.forEach(function(ip) {
+			rows.push(self.deviceRow(ip, 'добавлено вручную'));
+		});
 
-		this.renderManual();
+		if (!rows.length)
+			rows.push(E('div', { 'class': 'tx-muted' }, 'Аренды DHCP не найдены — добавьте IP вручную.'));
+		dom.content(this.deviceBox, rows);
 	},
 
 	leaseIP: function(l) {
 		return l.ipaddr || l.ip || '';
 	},
 
-	deviceRow: function(l) {
+	deviceRow: function(ip, host) {
 		var self = this;
-		var ip = this.leaseIP(l);
-		var host = l.hostname || l.macaddr || '';
-		var cb = E('input', { 'type': 'checkbox', 'checked': this.isSelected(ip) ? '' : null });
-		cb.addEventListener('change', function() { self.toggleDevice(ip, cb.checked); });
-		return E('label', { 'class': 'tx-check', 'style': 'display:flex;margin:2px 0' }, [
-			cb,
-			E('span', {}, [E('b', {}, ip), host ? E('span', { 'class': 'tx-muted' }, '  ' + host) : ''])
+		var sel = E('select', { 'class': 'cbi-input-select', 'style': 'width:220px' }, [
+			E('option', { 'value': '' }, '— без Tor —'),
+			E('option', { 'value': 'split' }, 'Раздельно (списки)'),
+			E('option', { 'value': 'full' }, 'Весь трафик через Tor')
+		]);
+		sel.value = this.deviceMode(ip);
+		sel.addEventListener('change', function() {
+			self.setDeviceMode(ip, sel.value);
+		});
+		return E('div', { 'class': 'tx-row', 'style': 'margin:4px 0;justify-content:space-between;align-items:center' }, [
+			E('span', {}, [E('b', {}, ip), host ? E('span', { 'class': 'tx-muted' }, '  ' + host) : '']),
+			sel
 		]);
 	},
 
-	isSelected: function(ip) {
-		return (this.state && (this.state.clients || []).indexOf(ip) >= 0);
+	deviceMode: function(ip) {
+		var sc = (this.state && this.state.clients) || [];
+		if (sc.indexOf(ip) >= 0)
+			return 'split';
+		var fc = (this.state && this.state.full_clients) || [];
+		if (fc.indexOf(ip) >= 0)
+			return 'full';
+		return '';
 	},
 
-	toggleDevice: function(ip, on) {
-		var cur = (this.state && this.state.clients) ? this.state.clients.slice() : [];
-		var pos = cur.indexOf(ip);
-		if (on && pos < 0) cur.push(ip);
-		if (!on && pos >= 0) cur.splice(pos, 1);
-		this.state.clients = cur;
-		this.renderManual();
+	setDeviceMode: function(ip, mode) {
+		var sc = ((this.state && this.state.clients) || []).slice()
+			.filter(function(x) { return x !== ip; });
+		var fc = ((this.state && this.state.full_clients) || []).slice()
+			.filter(function(x) { return x !== ip; });
+		if (mode === 'split')
+			sc.push(ip);
+		if (mode === 'full')
+			fc.push(ip);
+		this.state.clients = sc;
+		this.state.full_clients = fc;
 	},
 
 	addManual: function() {
@@ -236,29 +266,9 @@ return view.extend({
 			TX.notify('Неверный IP или подсеть: ' + ip, 'danger');
 			return;
 		}
-		var cur = (this.state && this.state.clients) ? this.state.clients.slice() : [];
-		if (cur.indexOf(ip) < 0) cur.push(ip);
-		this.state.clients = cur;
+		this.setDeviceMode(ip, this.manualMode.value);
 		this.manualClients.value = '';
-		this.renderManual();
-	},
-
-	renderManual: function() {
-		var self = this;
-		var leaseIPs = {};
-		(this.leases || []).forEach(function(l) { leaseIPs[self.leaseIP(l)] = true; });
-		var extra = ((this.state && this.state.clients) || []).filter(function(ip) { return !leaseIPs[ip]; });
-		dom.content(this.manualBox, extra.length ? [
-			'Вручную добавлены: ',
-			extra.map(function(ip, idx) {
-				var del = E('a', { 'href': '#', 'style': 'margin-left:4px;color:#c62828' }, '×');
-				del.addEventListener('click', function(ev) {
-					ev.preventDefault();
-					self.toggleDevice(ip, false);
-				});
-				return E('span', {}, [E('b', {}, ip), del, idx < extra.length - 1 ? E('span', { 'class': 'tx-muted' }, ', ') : '']);
-			})
-		] : [ 'Выбранные устройства: ' + (((this.state && this.state.clients) || []).length) ]);
+		this.renderDeviceList();
 	},
 
 	toggle: function(on) {
@@ -279,6 +289,7 @@ return view.extend({
 			mode: 'proxy',
 			scope: this.scope.value,
 			clients: (this.state && this.state.clients) || [],
+			full_clients: (this.state && this.state.full_clients) || [],
 			lists: lists,
 			custom_domains: this.customDomains.value.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length; }),
 			custom_subnets: this.customSubnets.value.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length; }),
@@ -291,7 +302,7 @@ return view.extend({
 	save: function() {
 		var self = this;
 		var v = this.values();
-		return callSave(v.enabled, v.mode, v.scope, v.clients, v.lists, v.custom_domains, v.custom_subnets, v.block_quic, v.block_dot, v.interval).then(function(res) {
+		return callSave(v.enabled, v.mode, v.scope, v.clients, v.full_clients, v.lists, v.custom_domains, v.custom_subnets, v.block_quic, v.block_dot, v.interval).then(function(res) {
 			TX.notify(res.message || (res.ok ? 'Применено' : 'Ошибка'), res.ok ? 'success' : 'danger');
 			if (res.state) {
 				self.state = res.state;
