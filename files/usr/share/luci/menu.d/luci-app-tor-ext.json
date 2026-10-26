@@ -77,6 +77,19 @@
 			]
 		}
 	},
+	"admin/services/tor-ext/split": {
+		"title": "Раздельное туннелирование",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "tor-ext/split"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-tor-ext"
+			]
+		}
+	},
 	"admin/services/tor-ext/logs": {
 		"title": "Логи",
 		"order": 70,

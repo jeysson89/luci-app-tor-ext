@@ -1,0 +1,460 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# luci-app-tor-ext: split tunneling over domain/subnet lists.
+#
+# The domains of the enabled lists are resolved through Tor DNS: dnsmasq
+# receives "server=/domain/127.0.0.1#9053" lines via its conf-dir and the
+# IPv4 addresses they resolve to land in the nftables set split_dsts4
+# (table tor_ext). List files are fetched from the project repository
+# (a mirror of itdoginfo/allow-domains, the same lists podkop uses).
+#
+# Usage: lists {fetch [ID...]|fetch-all|apply|merge|dnsconf|fill|
+#               resolve|resolve-bg|due|clear|status}
+# ---------------------------------------------------------------------------
+. /usr/libexec/tor-ext/lib.sh
+
+LISTS_DIR=/etc/tor-ext/lists
+STATE_DIR=/tmp/tor-ext
+TAB=/usr/share/tor-ext/list-files.tab
+REMOTE_BASE="https://raw.githubusercontent.com/jeysson89/luci-app-tor-ext/main/lists"
+MAX_DNSS_DOMAINS=4000
+JOBS=6
+DNSCONF_NAME=tor-ext-split.conf
+
+mkdir -p "$STATE_DIR" "$LISTS_DIR" 2>/dev/null
+log() { logger -t tor-ext "lists: $*"; }
+
+split_enabled() { tor_ext_uci split.enabled 0; }
+socks_port() { torrc_port SocksPort 9050; }
+dns_port() { torrc_port DNSPort 9053; }
+
+dnsconf_dir() {
+	local dir
+	dir=$(cat /var/etc/dnsmasq.conf.* 2>/dev/null | grep -m1 '^conf-dir=' | cut -d= -f2)
+	case "$dir" in
+		/*) printf '%s\n' "$dir" ;;
+	esac
+}
+
+# kind, file, subnets_id (fields 2-4 of list-files.tab)
+tab_lookup() {
+	awk -F'\t' -v id="$1" '$1 == id { print $2 "@" $3 "@" $4; exit }' "$TAB" 2>/dev/null
+}
+
+enabled_ids() {
+	uci -q get tor_ext.split.lists 2>/dev/null | tr ' \t' '\n\n' | grep -v '^$'
+}
+
+# ----- normalization -------------------------------------------------------
+
+norm_domain() {
+	local d
+	d=$(printf '%s' "$1" | sed 's/[[:space:]]//g')
+	case "$d" in
+		''|"#"*|"//"*) return ;;
+		*://*) d=${d#*://}; d=${d%%/*} ;;
+	 esac
+	case "$d" in
+		*[!A-Za-z0-9.-]*) return ;;
+		esac
+	while [ "$d" != "${d#*.}" ]; do d=${d#*.}; done
+	case "$d" in
+		'*'*) return ;;
+ esac
+	while [ "$d" != "${d%.}" ]; do d=${d%.}; done
+	case "$d" in
+		''|.[.]*) return ;;
+ esac
+	printf '%s' "$d" | grep -qE '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.){1,}[A-Za-z]{2,}$' || return
+	printf '%s\n' "$d"
+}
+
+norm_subnet() {
+	local s
+	s=$(printf '%s' "$1" | sed 's/[[:space:]]//g')
+	case "$s" in
+		''|"#"*|"//"*) return ;;
+		*[!0-9./]*) return ;;
+ esac
+	case "$s" in
+		.|"."|.*|*.) return ;;
+ esac
+	printf '%s' "$s" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$' || return
+	printf '%s\n' "$s"
+}
+
+# ------------------------------------------------------------------- fetch
+# download the list files into /etc/tor-ext/lists/; first via Tor (socks5),
+# then directly; on failure the previous copy is kept.
+do_fetch() {
+	local socksp tmp="$STATE_DIR/list.dl" id line file anyok=""
+	socksp=$(socks_port)
+
+	for id in "$@"; do
+		line=$(tab_lookup "$id")
+		if [ -z "$line" ]; then
+			log "unknown list id '$id'"
+			continue
+		fi
+		if [ -f "$LISTS_DIR/$id.stamp" ]; then
+			# already downloaded, keep the cached copy
+			anyok="$anyok$id"
+			continue
+		fi
+		log "downloading $id"
+		file=$(printf '%s' "$line" | cut -d@ -f2)
+
+		if curl -s -m 90 --socks5-hostname "127.0.0.1:$socksp" -o "$tmp" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$tmp" ]; then
+			anyok=1
+		elif curl -s -m 90 -o "$tmp" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$tmp" ]; then
+			anyok=1
+		fi
+
+		if [ -s "$tmp" ] && head -c 1 "$tmp" | grep -q '<'; then
+			:	# looks like an error page
+		else
+			mv "$tmp" "$LISTS_DIR/$id.lst" 2>/dev/null && date +%s > "$LISTS_DIR/$id.stamp"
+		fi
+		rm -f "$tmp"
+	done
+
+	if [ -z "$anyok" ]; then
+		log "fetch: nothing downloaded"
+		return 1
+	fi
+	log "fetch done"
+	return 0
+}
+
+# all ids needed for the enabled set: the lists and their subnets
+needed_ids() {
+	local id line sfile out=""
+	for id in $(enabled_ids); do
+		out="$out $id"
+		line=$(tab_lookup "$id")
+		case "$line" in
+			domains@*)
+				sfile=$(printf '%s' "$line" | cut -d@ -f3)
+				[ -n "$sfile" ] && out="$out $sfile"
+				;;
+		esac
+	done
+	printf '%s\n' "$out"
+}
+
+do_fetch_all() {
+	local ids
+	ids=$(needed_ids)
+	[ -n "$ids" ] && do_fetch $ids
+	return 0
+}
+
+# ------------------------------------------------------------------- merge
+do_merge() {
+	local domains="$STATE_DIR/split-domains.lst"
+	local subnets="$STATE_DIR/split-subnets.lst"
+	local tmpd="$STATE_DIR/.merge.d"
+	local tmps="$STATE_DIR/.merge.s"
+	: > "$tmpd"
+	: > "$tmps"
+
+	for d in $(uci -q get tor_ext.split.custom_domains 2>/dev/null); do
+		norm_domain "$d" >> "$tmpd"
+	done
+	for s in $(uci -q get tor_ext.split.custom_subnets 2>/dev/null); do
+		norm_subnet "$s" >> "$tmps"
+	done
+
+	local id line kind sfile
+	for id in $(enabled_ids); do
+		line=$(tab_lookup "$id")
+		kind=${line%%@*}
+		case "$kind" in
+			domains)
+				[ -f "$LISTS_DIR/$id.lst" ] || continue
+				while IFS= read -r l; do norm_domain "$l" >> "$tmpd"; done < "$LISTS_DIR/$id.lst"
+				sfile=$(printf '%s' "$line" | cut -d@ -f3)
+				if [ -n "$sfile" ] && [ "$sfile" != "$id" ] && [ -f "$LISTS_DIR/$sfile.lst" ]; then
+					while IFS= read -r l; do norm_subnet "$l" >> "$tmps"; done < "$LISTS_DIR/$sfile.lst"
+				fi
+				;;
+			subnets)
+				[ -f "$LISTS_DIR/$id.lst" ] || continue
+				while IFS= read -r l; do norm_subnet "$l" >> "$tmps"; done < "$LISTS_DIR/$id.lst"
+				;;
+		 *) ;;
+		esac
+	done
+
+	sort -u "$tmpd" | awk '!seen[$0]++' > "$domains.next"
+	sort -u "$tmps" | awk '!seen[$0]++' > "$subnets.next"
+	rm -f "$tmpd" "$tmps"
+
+	local n
+	n=$(cat "$domains.next" | wc -l)
+	if [ "$n" -gt "$MAX_DNSS_DOMAINS" ]; then
+		head -n "$MAX_DNSS_DOMAINS" "$domains.next" > "$domains"
+		log "dnsmasq list truncated to $MAX_DNSS_DOMAINS domains"
+		rm -f "$domains.next"
+	else
+		mv "$domains.next" "$domains"
+	fi
+	mv "$subnets.next" "$subnets"
+	[ -f "$STATE_DIR/split-resolved.lst" ] || : > "$STATE_DIR/split-resolved.lst"
+
+	local nd ns
+	nd="$(wc -l < "$domains" 2>/dev/null)"
+	ns="$(wc -l < "$subnets" 2>/dev/null)"
+	printf '%s\n' "$nd" > "$STATE_DIR/split-domains.count"
+	printf '%s\n' "$ns" > "$STATE_DIR/split-subnets.count"
+	log "merge: $nd domains, $ns subnets"
+}
+
+# ------------------------------------------------------------------ dnsmasq
+do_dnsconf() {
+	local dir conf
+	dir=$(dnsconf_dir)
+	if [ -z "$dir" ]; then
+		log "dnsmasq conf-dir not found, dns splitting unavailable"
+		return 1
+	fi
+	conf="$dir/$DNSCONF_NAME"
+
+	if [ ! -s "$STATE_DIR/split-domains.lst" ]; then
+		do_merge
+	fi
+
+	local dnsport nds
+	dnsport=$(dns_port)
+	nds=$(cat "$STATE_DIR/split-domains.lst" | wc -l)
+
+	if [ "$(split_enabled)" = "1" ] && [ "$nds" != "0" ] 2>/dev/null; then
+		{
+			echo "# tor-ext: domains from the enabled lists are resolved through Tor"
+			while IFS= read -r d; do
+				[ -n "$d" ] && echo "server=/$d/127.0.0.1#$dnsport"
+			done < "$STATE_DIR/split-domains.lst"
+		} > "$STATE_DIR/.dnsconf"
+	else
+		: > "$STATE_DIR/.dnsconf"
+	fi
+
+	if cmp -s "$conf" "$STATE_DIR/.dnsconf" 2>/dev/null; then
+		rm -f "$STATE_DIR/.dnsconf"
+		return 0
+	fi
+
+	cp "$STATE_DIR/.dnsconf" "$conf"
+	rm -f "$STATE_DIR/.dnsconf"
+
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	log "dnsmasq updated: $nds domains go through Tor DNS"
+	return 0
+}
+
+# ------------------------------------------------------------------ nft set
+do_fill() {
+	nft list tables 2>/dev/null | grep -q 'tor_ext' || return 0
+
+	local out="$STATE_DIR/split-set.nft"
+	: > "$out"
+	echo "flush set inet tor_ext split_dsts4" >> "$out"
+
+	local buf="" count=0 total=0
+	flush_chunk() {
+		[ "$count" = "0" ] && return 0
+		echo "$buf }" >> "$out"
+		buf=""
+		count=0
+		return 0
+	}
+	add_elem() {
+		if [ "$count" = "0" ]; then
+			buf="add element inet tor_ext split_dsts4 { $1"
+		else
+			buf="$buf, $1"
+		fi
+		count=$((count + 1))
+		total=$((total + 1))
+		if [ "$count" -ge 200 ]; then
+			flush_chunk
+		fi
+		return 0
+	}
+
+	local el
+	for el in $(sort -u "$STATE_DIR/split-subnets.lst" 2>/dev/null); do
+		add_elem "$el"
+	done
+	for el in $(sort -u "$STATE_DIR/split-resolved.lst" 2>/dev/null); do
+		add_elem "$el"
+	done
+	flush_chunk
+
+	if [ "$total" != "0" ]; then
+		if nft -c -f "$out" >/dev/null 2>&1; then
+			nft -f "$out" >/dev/null 2>&1
+			log "split_dsts4 refilled ($total elements)"
+		else
+			log "warning: split-set.nft rejected by nft -c"
+		fi
+	fi
+	rm -f "$out"
+	return 0
+}
+
+# ------------------------------------------------------------------ resolve
+do_resolve() {
+	local lock="$STATE_DIR/resolve.pid"
+	if [ -f "$lock" ]; then
+		local p
+		p=$(cat "$lock" 2>/dev/null)
+		if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+			log "resolver already running (pid $p)"
+			return 0
+		fi
+		rm -f "$lock"
+	fi
+	if [ ! -s "$STATE_DIR/split-domains.lst" ]; then
+		return 0
+	fi
+
+	local PORT j
+	PORT=$(dns_port)
+	echo $$ > "$lock"
+
+	mkdir -p "$STATE_DIR/res"
+	for j in $(awk -v n="$JOBS" 'BEGIN{for(i=1;i<=n;i++)print i}'); do
+		: > "$STATE_DIR/res/out.$j"
+	(
+		awk -v job="$j" -v n="$JOBS" 'NR % n == job - 1' "$STATE_DIR/split-domains.lst" \
+		| while IFS= read -r d; do
+				[ -n "$d" ] || continue
+				nslookup -timeout=9 "$d" "127.0.0.1:$PORT" 2>/dev/null \
+					| grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+					| while IFS= read -r ip; do
+						case "$ip" in
+							127.*|0.0.0.0) ;;
+							*) printf '%s\n' "$ip" ;;
+						esac
+					done >> "$STATE_DIR/res/out.$j"
+		done
+	) >/dev/null 2>&1 &
+	done
+	wait
+
+	for j in $(seq 1 "$JOBS"); do sort -u "$STATE_DIR/res/out.$j" 2>/dev/null; done \
+		| sort -u > "$STATE_DIR/.res"
+	mv "$STATE_DIR/.res" "$STATE_DIR/split-resolved.lst"
+	date +%s > "$STATE_DIR/split-resolved.stamp"
+	rm -f "$STATE_DIR"/res/out.* "$lock"
+
+	local n
+	n="$(wc -l < "$STATE_DIR/split-resolved.lst" 2>/dev/null)"
+	log "resolve done ($n IPv4)"
+	do_fill
+	return 0
+}
+
+# --------------------------------------------------------------------- cron
+do_due() {
+	[ "$(split_enabled)" = "1" ] || return 0
+
+	local now last els interval
+	now=$(date +%s)
+	[ -f "$STATE_DIR/split-resolved.stamp" ] && last=$(cat "$STATE_DIR/split-resolved.stamp")
+	els=$((now - last))
+	case "$(tor_ext_uci split.interval 6h)" in
+		1h)  interval=3600 ;;
+		12h) interval=43200 ;;
+		24h) interval=86400 ;;
+		*)   interval=21600 ;;
+	esac
+	if [ "$els" -lt "$interval" ]; then
+		return 0
+	fi
+
+	log "lists refresh is due (${els}s since last update)"
+	do_fetch_all
+	do_apply
+	( do_resolve ) >/dev/null 2>&1 &
+	return 0
+}
+
+# -------------------------------------------------------------------- apply
+do_apply() {
+	if [ "$(split_enabled)" = "1" ]; then
+		do_merge
+		do_dnsconf
+		do_fill
+	else
+		: > "$STATE_DIR/split-domains.lst"
+		: > "$STATE_DIR/split-subnets.lst"
+		: > "$STATE_DIR/split-resolved.lst"
+		printf '0\n' > "$STATE_DIR/split-domains.count"
+		printf '0\n' > "$STATE_DIR/split-subnets.count"
+		local dir
+		dir=$(dnsconf_dir)
+		[ -n "$dir" ] && rm -f "$dir/$DNSCONF_NAME"
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+		do_fill
+	fi
+	return 0
+}
+
+# -------------------------------------------------------------------- clear
+do_clear() {
+	local dir
+	dir=$(dnsconf_dir)
+	[ -n "$dir" ] && rm -f "$dir/$DNSCONF_NAME"
+	nft flush set inet tor_ext split_dsts4 2>/dev/null
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------- status
+do_status() {
+	local dir
+	dir=$(dnsconf_dir)
+	echo "enabled=$(split_enabled)"
+	echo "domains=$(cat "$STATE_DIR/split-domains.lst" 2>/dev/null | wc -l)"
+	echo "subnets=$(cat "$STATE_DIR/split-subnets.lst" 2>/dev/null | wc -l)"
+	echo "resolved=$(cat "$STATE_DIR/split-resolved.lst" 2>/dev/null | wc -l)"
+	echo "dnsmasq_conf=$([ -f "$dir/$DNSCONF_NAME" ] && echo yes || echo no)"
+	nft list set inet tor_ext split_dsts4 > /dev/null 2>&1 && echo "set=ok" || echo "set=absent"
+}
+
+# ---------------------------------------------------------------------- boot
+# at service start: restore from the local caches, no network fetch.
+do_boot() {
+	if [ "$(split_enabled)" = "1" ]; then
+		[ -s "$STATE_DIR/split-domains.lst" ] || [ -s "$STATE_DIR/split-subnets.lst" ] || return 0
+		do_merge
+		do_dnsconf
+		do_fill
+		if tor_ext_running && [ "$(tor_ext_uci split.autostart_resolve 1)" != "0" ]; then
+			( sleep 15; do_resolve ) >/dev/null 2>&1 &
+		fi
+	else
+		do_clear >/dev/null 2>&1 || true
+	fi
+	return 0
+}
+
+case "$1" in
+	fetch)		shift; do_fetch "$@" ;;
+	fetch-all)	do_fetch_all ;;
+	apply)		do_apply ;;
+	merge)		do_merge ;;
+	dnsconf)	do_dnsconf ;;
+	fill)		do_fill ;;
+	resolve)	do_resolve ;;
+	resolve-bg)	( do_resolve ) >/dev/null 2>&1 & ;;
+	due)		do_due ;;
+	boot)		do_boot ;;
+	clear)		do_clear ;;
+	status)		do_status ;;
+	*)
+		echo "Usage: lists {fetch [ID...]|fetch-all|apply|merge|dnsconf|fill|resolve|resolve-bg|due|clear|status}"
+		exit 1
+		;;
+esac

@@ -735,25 +735,54 @@ function setEnabled(args)
 }
 
 /* очистка таблиц: fdb - MAC-адреса моста, arp - ARP-кэш */
+/* устройства локальной (LAN) стороны: мосты + их порты + Wi-Fi точки.
+ * Наличие устройства в этом наборе определяет, что его ARP/FDB-записи
+ * можно чистить, не затрагивая транзитный интернет-канал. */
+function lanDevices()
+{
+	const set = {};
+	const brs = bridges() || [];
+
+	/* сами мосты и их порты */
+	for (let i = 0; i < length(brs); i++) {
+		set[brs[i]] = true;
+
+		const ports = lsdir(`${SYSNET}/${brs[i]}/brif`) || [];
+		for (let j = 0; j < length(ports); j++)
+			set[ports[j]] = true;
+	}
+
+	/* Wi-Fi точки доступа */
+	const wifi = wirelessPorts() || [];
+	for (let i = 0; i < length(wifi); i++) {
+		if (length(wifi[i].name))
+			set[wifi[i].name] = true;
+	}
+
+	return set;
+}
+
 function flushMac(args)
 {
 	const what = trim(args?.what || 'fdb');
 	const res = { ok: true, removed: 0, message: '' };
 
-	if (!length(trim(sh('command -v bridge 2>/dev/null')))) {
-		return {
-			ok: false,
-			message: 'Не установлена утилита bridge (ip-bridge). Установите пакет ip-bridge для очистки таблицы MAC.',
-		};
-	}
-
-	if (what == 'fdb' || what == 'all') {
-		const brs = bridges();
+	if (what == 'fdb') {
+		const brs = bridges() || [];
 		const before = length(fdbEntries());
 
+		if (!length(trim(sh('command -v bridge 2>/dev/null')))) {
+			return {
+				ok: false,
+				message: 'Не установлена утилита bridge (ip-bridge). Установите пакет ip-bridge для очистки таблицы MAC.',
+			};
+		}
+
 		for (let i = 0; i < length(brs); i++) {
+			/* ТОЛЬКО динамические записи: постойные (permanent/local), в том
+			 * числе запись самого моста, трогать нельзя — иначе портится
+			 * связность моста с CPU и интернет "отваливается" до ребута. */
 			sh(`bridge fdb flush dev ${brs[i]} dynamic 2>/dev/null`);
-			sh(`bridge fdb flush dev ${brs[i]} 2>/dev/null`);
 		}
 
 		const after = length(fdbEntries());
@@ -761,12 +790,45 @@ function flushMac(args)
 		res.message = 'Таблица MAC-адресов (bridge FDB) очищена.';
 	}
 
-	if (what == 'arp' || what == 'all') {
-		sh('ip neigh flush all 2>/dev/null');
+	if (what == 'arp') {
+		/* вычищаем ARP построчно и только на LAN-устройствах;
+		 * записи WAN (вышестоящий шлюз) и статические (permanent) остаются. */
+		const lan = lanDevices();
+		const lines = split(sh('cat /proc/net/arp 2>/dev/null'), '\n');
+		let removed = 0;
 
-		if (length(res.message))
-			res.message += ' ';
-		res.message += 'ARP-кэш очищен.';
+		for (let i = 0; i < length(lines); i++) {
+			const line = trim(lines[i]);
+			if (!length(line))
+				continue;
+
+			const parts = split(line, /[ \t]+/);
+			if (length(parts) < 6 || parts[0] == 'IP')
+				continue;
+
+			const ip = parts[0];
+			const dev = parts[5];
+
+			/* flags приходят в hex ("0x2", "0x6"); 0x4 = ATF_PERM (статическая) */
+			let flagStr = trim(parts[2]);
+			if (substr(flagStr, 0, 2) == '0x')
+				flagStr = substr(flagStr, 2);
+			const flags = int(flagStr, 16);
+
+			/* постойные/статические записи не трогаем */
+			if (flags & 0x4)
+				continue;
+
+			/* устройства, не относящиеся к LAN (WAN и т.п.), не трогаем */
+			if (!lan[dev])
+				continue;
+
+			sh(`ip neigh del ${ip} dev ${dev} 2>/dev/null`);
+			removed++;
+		}
+
+		res.removed = removed;
+		res.message = 'ARP-кэш очищен (только LAN, статические и WAN-записи сохранены).';
 	}
 
 	return res;
@@ -949,9 +1011,19 @@ function torch()
 		});
 	}
 
-	flows.sort(function(a, b) {
-		return b.bytes - a.bytes;
-	});
+	/* сортировка по убыванию трафика (без Array.sort — ucode не поддерживает) */
+	for (let i = 0; i < length(flows); i++) {
+		let max = i;
+		for (let j = i + 1; j < length(flows); j++) {
+			if (flows[j].bytes > flows[max].bytes)
+				max = j;
+		}
+		if (max != i) {
+			let tmp = flows[i];
+			flows[i] = flows[max];
+			flows[max] = tmp;
+		}
+	}
 
 	/* счётчики интерфейсов */
 	const ifstats = [];

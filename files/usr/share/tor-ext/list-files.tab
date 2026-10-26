@@ -1,0 +1,34 @@
+russia_inside	domains	russia_inside.lst		Россия
+cloudflare	domains	cloudflare.lst	subnets-cloudflare	Сервисы
+cloudfront	domains	cloudfront.lst	subnets-cloudfront	Сервисы
+digitalocean	domains	digitalocean.lst	subnets-digitalocean	Сервисы
+discord	domains	discord.lst	subnets-discord	Сервисы
+google_ai	domains	google_ai.lst		Сервисы
+google_meet	domains	google_meet.lst	subnets-google_meet	Сервисы
+google_play	domains	google_play.lst		Сервисы
+hdrezka	domains	hdrezka.lst		Сервисы
+hetzner	domains	hetzner.lst	subnets-hetzner	Сервисы
+meta	domains	meta.lst	subnets-meta	Сервисы
+ovh	domains	ovh.lst	subnets-ovh	Сервисы
+roblox	domains	roblox.lst	subnets-roblox	Сервисы
+telegram	domains	telegram.lst	subnets-telegram	Сервисы
+tiktok	domains	tiktok.lst		Сервисы
+twitter	domains	twitter.lst	subnets-twitter	Сервисы
+youtube	domains	youtube.lst		Сервисы
+anime	domains	anime.lst		Категории
+block	domains	block.lst		Категории
+news	domains	news.lst		Категории
+porn	domains	porn.lst		Категории
+hodca	domains	hodca.lst		Категории
+geoblock	domains	geoblock.lst		Категории
+subnets-cloudflare	subnets	subnets-cloudflare.lst		Подсети
+subnets-cloudfront	subnets	subnets-cloudfront.lst		Подсети
+subnets-digitalocean	subnets	subnets-digitalocean.lst		Подсети
+subnets-discord	subnets	subnets-discord.lst		Подсети
+subnets-google_meet	subnets	subnets-google_meet.lst		Подсети
+subnets-hetzner	subnets	subnets-hetzner.lst		Подсети
+subnets-meta	subnets	subnets-meta.lst		Подсети
+subnets-ovh	subnets	subnets-ovh.lst		Подсети
+subnets-roblox	subnets	subnets-roblox.lst		Подсети
+subnets-telegram	subnets	subnets-telegram.lst		Подсети
+subnets-twitter	subnets	subnets-twitter.lst		Подсети

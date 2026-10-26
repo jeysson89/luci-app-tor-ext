@@ -58,7 +58,28 @@ if ! grep -q 'tor-ext/watchdog' /etc/crontabs/root 2>/dev/null; then
 	log "installed the watchdog cron entry"
 fi
 
-# 6) enable the service that applies the transparent proxying rules
+# 6) the hourly split-lists refresh (periodic resolver/fetcher)
+if ! grep -q 'tor-ext/lists due' /etc/crontabs/root 2>/dev/null; then
+	mkdir -p /etc/crontabs
+	echo '10 * * * * /usr/libexec/tor-ext/lists due >/dev/null 2>&1' >> /etc/crontabs/root
+	/etc/init.d/cron reload 2>/dev/null
+	log "installed the split lists cron entry"
+fi
+
+# 7) defaults for split tunneling (kept for existing configurations)
+if [ -z "$(uci -q get tor_ext.split 2>/dev/null)" ]; then
+	uci -q set tor_ext.split='split' || true
+	uci -q set tor_ext.split.enabled='0'
+	uci -q set tor_ext.split.mode='proxy'
+	uci -q set tor_ext.split.scope='clients'
+	uci -q set tor_ext.split.block_quic='1'
+	uci -q set tor_ext.split.block_dot='1'
+	uci -q set tor_ext.split.interval='6h'
+	uci -q commit tor_ext
+	log "added the split tunneling defaults"
+fi
+
+# 8) enable the service that applies the transparent proxying rules
 /etc/init.d/tor-ext enable 2>/dev/null
 /etc/init.d/tor enable 2>/dev/null
 

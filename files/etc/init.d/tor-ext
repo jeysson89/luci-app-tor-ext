@@ -6,6 +6,7 @@ STOP=05
 start() {
 	. /usr/libexec/tor-ext/lib.sh
 	tor_ext_ensure_baseline
+	/usr/libexec/tor-ext/lists boot >/dev/null 2>&1
 	/usr/libexec/tor-ext/apply-proxy apply
 }
 

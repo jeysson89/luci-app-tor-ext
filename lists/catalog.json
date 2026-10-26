@@ -1,0 +1,324 @@
+{
+	"source": "itdoginfo/allow-domains",
+	"source_url": "https://github.com/itdoginfo/allow-domains",
+	"license": "MIT",
+	"lists": [
+		{
+			"id": "russia_inside",
+			"kind": "domains",
+			"title": "Сборный список «Россия»",
+			"group": "Россия",
+			"desc": "https, twitter, meta, новости и прочие сайты, которым нужен обход блокировок",
+			"file": "russia_inside.lst",
+			"count": 1183
+		},
+		{
+			"id": "cloudflare",
+			"kind": "domains",
+			"title": "Cloudflare",
+			"group": "Сервисы",
+			"desc": "Домены Cloudflare",
+			"file": "cloudflare.lst",
+			"count": 4,
+			"subnets_of": "subnets-cloudflare"
+		},
+		{
+			"id": "cloudfront",
+			"kind": "domains",
+			"title": "Cloudfront (Amazon)",
+			"group": "Сервисы",
+			"desc": "Домены Amazon Cloudfront",
+			"file": "cloudfront.lst",
+			"count": 1,
+			"subnets_of": "subnets-cloudfront"
+		},
+		{
+			"id": "digitalocean",
+			"kind": "domains",
+			"title": "DigitalOcean",
+			"group": "Сервисы",
+			"desc": "Домены DigitalOcean",
+			"file": "digitalocean.lst",
+			"count": 1,
+			"subnets_of": "subnets-digitalocean"
+		},
+		{
+			"id": "discord",
+			"kind": "domains",
+			"title": "Discord",
+			"group": "Сервисы",
+			"desc": "Голосовые и текстовые чаты Discord",
+			"file": "discord.lst",
+			"count": 20,
+			"subnets_of": "subnets-discord"
+		},
+		{
+			"id": "google_ai",
+			"kind": "domains",
+			"title": "Google AI (Gemini)",
+			"group": "Сервисы",
+			"desc": "Gemini и другие AI-сервисы Google",
+			"file": "google_ai.lst",
+			"count": 28
+		},
+		{
+			"id": "google_meet",
+			"kind": "domains",
+			"title": "Google Meet",
+			"group": "Сервисы",
+			"desc": "Видеоконференции Google",
+			"file": "google_meet.lst",
+			"count": 5,
+			"subnets_of": "subnets-google_meet"
+		},
+		{
+			"id": "google_play",
+			"kind": "domains",
+			"title": "Google Play",
+			"group": "Сервисы",
+			"desc": "Магазин приложений Google",
+			"file": "google_play.lst",
+			"count": 12
+		},
+		{
+			"id": "hdrezka",
+			"kind": "domains",
+			"title": "HDRezka",
+			"group": "Сервисы",
+			"desc": "Онлайн-кинотеатр HDRezka",
+			"file": "hdrezka.lst",
+			"count": 17
+		},
+		{
+			"id": "hetzner",
+			"kind": "domains",
+			"title": "Hetzner",
+			"group": "Сервисы",
+			"desc": "Домены Hetzner",
+			"file": "hetzner.lst",
+			"count": 1,
+			"subnets_of": "subnets-hetzner"
+		},
+		{
+			"id": "meta",
+			"kind": "domains",
+			"title": "Meta (Instagram, Facebook, WhatsApp)",
+			"group": "Сервисы",
+			"desc": "Соцсети Meta",
+			"file": "meta.lst",
+			"count": 18,
+			"subnets_of": "subnets-meta"
+		},
+		{
+			"id": "ovh",
+			"kind": "domains",
+			"title": "OVH",
+			"group": "Сервисы",
+			"desc": "Домены OVH",
+			"file": "ovh.lst",
+			"count": 1,
+			"subnets_of": "subnets-ovh"
+		},
+		{
+			"id": "roblox",
+			"kind": "domains",
+			"title": "Roblox",
+			"group": "Сервисы",
+			"desc": "Игровая платформа Roblox",
+			"file": "roblox.lst",
+			"count": 4,
+			"subnets_of": "subnets-roblox"
+		},
+		{
+			"id": "telegram",
+			"kind": "domains",
+			"title": "Telegram",
+			"group": "Сервисы",
+			"desc": "Веб-версия Telegram",
+			"file": "telegram.lst",
+			"count": 20,
+			"subnets_of": "subnets-telegram"
+		},
+		{
+			"id": "tiktok",
+			"kind": "domains",
+			"title": "TikTok",
+			"group": "Сервисы",
+			"desc": "TikTok и CDN",
+			"file": "tiktok.lst",
+			"count": 16
+		},
+		{
+			"id": "twitter",
+			"kind": "domains",
+			"title": "Twitter (X)",
+			"group": "Сервисы",
+			"desc": "Твиттер и CDN twimg",
+			"file": "twitter.lst",
+			"count": 23,
+			"subnets_of": "subnets-twitter"
+		},
+		{
+			"id": "youtube",
+			"kind": "domains",
+			"title": "YouTube",
+			"group": "Сервисы",
+			"desc": "Видео YouTube и CDN googlevideo",
+			"file": "youtube.lst",
+			"count": 18
+		},
+		{
+			"id": "anime",
+			"kind": "domains",
+			"title": "Аниме-сервисы",
+			"group": "Категории",
+			"desc": "Заблокированные аниме-сервисы",
+			"file": "anime.lst",
+			"count": 42
+		},
+		{
+			"id": "block",
+			"kind": "domains",
+			"title": "Заблокированное в РФ",
+			"group": "Категории",
+			"desc": "Сайты, заблокированные в России",
+			"file": "block.lst",
+			"count": 335
+		},
+		{
+			"id": "news",
+			"kind": "domains",
+			"title": "Новости (медиа)",
+			"group": "Категории",
+			"desc": "Заблокированные или замедленные новостные сайты",
+			"file": "news.lst",
+			"count": 184
+		},
+		{
+			"id": "porn",
+			"kind": "domains",
+			"title": "Порно-сервисы",
+			"group": "Категории",
+			"desc": "Заблокированные в РФ",
+			"file": "porn.lst",
+			"count": 51
+		},
+		{
+			"id": "hodca",
+			"kind": "domains",
+			"title": "Прочее (сообщество)",
+			"group": "Категории",
+			"desc": "Прочие полезные домены",
+			"file": "hodca.lst",
+			"count": 250
+		},
+		{
+			"id": "geoblock",
+			"kind": "domains",
+			"title": "Сайты с геоблокировкой",
+			"group": "Категории",
+			"desc": "Сервисы, которые сами блокируют российские IP",
+			"file": "geoblock.lst",
+			"count": 465
+		},
+		{
+			"id": "subnets-cloudflare",
+			"kind": "subnets",
+			"title": "Cloudflare — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети Cloudflare",
+			"file": "subnets-cloudflare.lst",
+			"count": 15
+		},
+		{
+			"id": "subnets-cloudfront",
+			"kind": "subnets",
+			"title": "Cloudfront — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети Cloudfront",
+			"file": "subnets-cloudfront.lst",
+			"count": 214
+		},
+		{
+			"id": "subnets-digitalocean",
+			"kind": "subnets",
+			"title": "DigitalOcean — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети DigitalOcean",
+			"file": "subnets-digitalocean.lst",
+			"count": 168
+		},
+		{
+			"id": "subnets-discord",
+			"kind": "subnets",
+			"title": "Discord — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Серверы Discord (голос)",
+			"file": "subnets-discord.lst",
+			"count": 10
+		},
+		{
+			"id": "subnets-google_meet",
+			"kind": "subnets",
+			"title": "Google Meet — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети Google Meet",
+			"file": "subnets-google_meet.lst",
+			"count": 3
+		},
+		{
+			"id": "subnets-hetzner",
+			"kind": "subnets",
+			"title": "Hetzner — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети Hetzner",
+			"file": "subnets-hetzner.lst",
+			"count": 81
+		},
+		{
+			"id": "subnets-meta",
+			"kind": "subnets",
+			"title": "Meta — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Серверы Meta",
+			"file": "subnets-meta.lst",
+			"count": 79
+		},
+		{
+			"id": "subnets-ovh",
+			"kind": "subnets",
+			"title": "OVH — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети OVH",
+			"file": "subnets-ovh.lst",
+			"count": 643
+		},
+		{
+			"id": "subnets-roblox",
+			"kind": "subnets",
+			"title": "Roblox — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Сети Roblox",
+			"file": "subnets-roblox.lst",
+			"count": 2
+		},
+		{
+			"id": "subnets-telegram",
+			"kind": "subnets",
+			"title": "Telegram — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Серверы Telegram",
+			"file": "subnets-telegram.lst",
+			"count": 10
+		},
+		{
+			"id": "subnets-twitter",
+			"kind": "subnets",
+			"title": "Twitter — подсети IPv4",
+			"group": "Подсети",
+			"desc": "Серверы Twitter",
+			"file": "subnets-twitter.lst",
+			"count": 10
+		}
+	]
+}

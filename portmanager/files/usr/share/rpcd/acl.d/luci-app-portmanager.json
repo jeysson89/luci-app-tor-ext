@@ -4,14 +4,17 @@
 		"read": {
 			"ubus": {
 				"portmanager": [
-					"list"
+					"list",
+					"torch"
 				]
 			}
 		},
 		"write": {
 			"ubus": {
 				"portmanager": [
-					"setEnabled"
+					"setEnabled",
+					"flushMac",
+					"deleteMac"
 				]
 			}
 		}

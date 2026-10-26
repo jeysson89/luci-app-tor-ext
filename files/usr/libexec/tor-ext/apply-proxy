@@ -16,6 +16,13 @@ block_quic=$(tor_ext_uci proxy.block_quic 1)
 block_dot=$(tor_ext_uci proxy.block_dot 1)
 router_traffic=$(tor_ext_uci proxy.router_traffic 0)
 
+# split tunneling (дому based on the podkop lists)
+split_enabled=$(tor_ext_uci split.enabled 0)
+split_mode=$(tor_ext_uci split.mode proxy)
+split_scope=$(tor_ext_uci split.scope clients)
+split_block_quic=$(tor_ext_uci split.block_quic 1)
+split_dot=$(tor_ext_uci split.block_dot 1)
+
 trans_port=$(torrc_port TransPort 9040)
 dns_port=$(torrc_port DNSPort 9053)
 socks_port=$(torrc_port SocksPort 9050)
@@ -53,20 +60,48 @@ collect_clients() {
 	printf '%s' "$out"
 }
 
+collect_split_clients() {
+	local out="" ip
+	if [ "$split_scope" = "all" ]; then
+		ip=$(lan_subnet)
+		[ -n "$ip" ] && out="$ip"
+	else
+		for ip in $(uci -q get tor_ext.split.client 2>/dev/null); do
+			case "$ip" in
+				*[!0-9./]*) continue ;;
+			esac
+			case "$ip" in
+				*.*.*.*) ;;
+				*) continue ;;
+			esac
+			out="${out:+$out, }$ip"
+		done
+	fi
+	printf '%s' "$out"
+}
+
 # Build $RULES from the current UCI configuration.
 build_rules() {
-	local clients tor_uid
+	local clients tor_uid split_clients
 
-	if [ "$enabled" != "1" ]; then
+	if [ "$enabled" != "1" ] && [ "$split_enabled" != "1" ]; then
 		echo "# прозрачное проксирование выключено" > "$RULES"
 		return 0
 	fi
 
 	clients=$(collect_clients)
-	if [ -z "$clients" ] && [ "$mode" != "all" ]; then
+	if [ "$enabled" = "1" ] && [ -z "$clients" ] && [ "$mode" != "all" ]; then
 		logger -t tor-ext "proxy: no client addresses configured"
 		echo "# не заданы адреса клиентов" > "$RULES"
 		return 1
+	fi
+
+	if [ "$split_enabled" = "1" ]; then
+		split_clients=$(collect_split_clients)
+		if [ -z "$split_clients" ]; then
+			logger -t tor-ext "split: no client addresses for split tunneling"
+			[ "$enabled" != "1" ] && echo "# не заданы адреса клиентов раздельного туннелирования" > "$RULES"
+		fi
 	fi
 
 	tor_uid=$(id -u tor 2>/dev/null)
@@ -80,8 +115,31 @@ build_rules() {
 			echo "		elements = { $clients }"
 			echo "	}"
 		fi
+		if [ "$split_enabled" = "1" ]; then
+			if [ -n "$split_clients" ]; then
+				echo "	set split_clients {"
+				echo "		type ipv4_addr"
+				echo "		flags interval"
+				echo "		elements = { $split_clients }"
+				echo "	}"
+			fi
+			echo "	set split_dsts4 {"
+			echo "		type ipv4_addr"
+			echo "		flags interval"
+			echo "	}"
+		fi
 		echo "	chain prerouting {"
 		echo "		type nat hook prerouting priority dstnat - 5; policy accept;"
+		if [ "$split_enabled" = "1" ] && [ "$split_mode" = "proxy" ] && [ -n "$split_clients" ]; then
+			# Раздельное туннелирование: только адреса из списков идут в Tor,
+			# остальное - напрямую. DNS клиентов специально не глобально
+			# перенаправляется: dnsmasq сам fazоразрешает домены списков через Tor
+			# (server=/домены/... через conf-dir).
+			echo "		ip saddr @split_clients ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return"
+			echo "		ip saddr @split_clients tcp dport { $trans_port, $dns_port, $socks_port, 9051 } return"
+			[ "$split_dot" = "1" ] && echo "		ip saddr @split_clients tcp dport 853 reject"
+			echo "		ip saddr @split_clients ip daddr @split_dsts4 meta l4proto tcp redirect to :$trans_port counter"
+		fi
 		if [ -n "$clients" ]; then
 			# The DNS redirect must be placed before the "private networks"
 			# exception: otherwise the clients keep using the local resolver
@@ -92,6 +150,10 @@ build_rules() {
 				echo "		ip saddr @clients tcp dport 53 redirect to :$dns_port"
 			fi
 			echo "		ip saddr @clients ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return"
+			if [ "$split_enabled" = "1" ] && [ "$split_mode" = "direct" ]; then
+				# Исключения из полного туннеля: адреса из списков напрямую
+				echo "		ip saddr @clients ip daddr @split_dsts4 return"
+			fi
 			[ "$block_dot" = "1" ] && echo "		ip saddr @clients tcp dport 853 reject"
 			[ "$redirect_tcp" = "1" ] && echo "		ip saddr @clients meta l4proto tcp redirect to :$trans_port"
 		fi
@@ -109,9 +171,18 @@ build_rules() {
 		echo "	}"
 		echo "	chain forward {"
 		echo "		type filter hook forward priority filter - 5; policy accept;"
-		[ -n "$clients" ] && [ "$killswitch" = "1" ] && echo "		ip saddr @clients counter drop"
-		[ "$block_ipv6" = "1" ] && echo "		iifname \"$lan_dev\" meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited"
+		if [ -n "$clients" ]; then
+			if [ "$killswitch" = "1" ] && [ "$split_enabled" = "1" ] && [ "$split_mode" = "direct" ]; then
+				echo "		ip saddr @clients ip daddr != @split_dsts4 counter drop"
+			elif [ "$killswitch" = "1" ]; then
+				echo "		ip saddr @clients counter drop"
+			fi
+		fi
 		[ -n "$clients" ] && [ "$block_quic" = "1" ] && echo "		ip saddr @clients udp dport 443 counter reject"
+		if [ "$split_enabled" = "1" ] && [ -n "$split_clients" ]; then
+			[ "$split_block_quic" = "1" ] && echo "		ip saddr @split_clients ip daddr @split_dsts4 udp dport 443 counter reject"
+		fi
+		[ "$block_ipv6" = "1" ] && echo "		iifname \"$lan_dev\" meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited"
 		echo "	}"
 		echo "}"
 	} > "$RULES"
@@ -120,7 +191,7 @@ build_rules() {
 }
 
 apply_rules() {
-	if [ "$enabled" != "1" ]; then
+	if [ "$enabled" != "1" ] && [ "$split_enabled" != "1" ]; then
 		clear_rules
 		return 0
 	fi
@@ -139,6 +210,11 @@ apply_rules() {
 		return 1
 	}
 
+	# наполнить set split_dsts4 (подсети + IPs из последнего разрешения)
+	if [ "$split_enabled" = "1" ]; then
+		/usr/libexec/tor-ext/lists fill >/dev/null 2>&1
+	fi
+
 	mkdir -p "$TOR_EXT_STATE"
 	{
 		echo "mode=$mode"
@@ -151,8 +227,11 @@ apply_rules() {
 		echo "block_ipv6=$block_ipv6"
 		echo "block_quic=$block_quic"
 		echo "block_dot=$block_dot"
+		echo "split_enabled=$split_enabled"
+		echo "split_mode=$split_mode"
+		echo "split_clients=$(collect_split_clients)"
 	} > "$TOR_EXT_STATE/proxy.applied"
-	logger -t tor-ext "proxy: rules applied (mode=$mode clients=$(collect_clients))"
+	logger -t tor-ext "proxy: rules applied (mode=$mode clients=$(collect_clients) split=$split_enabled/$split_mode)"
 	return 0
 }
 
@@ -163,9 +242,10 @@ case "$1" in
 	show)	  nft list table inet "$NFT_TABLE" 2>/dev/null ;;
 	counters) nft list table inet "$NFT_TABLE" 2>/dev/null ;;
 	clients)  collect_clients; echo ;;
+	split)	  collect_split_clients; echo ;;
 	lan)	  lan_dev; echo; lan_subnet; echo ;;
 	*)
-		echo "Usage: $0 {apply|generate|clear|show|counters|clients|lan}"
+		echo "Usage: $0 {apply|generate|clear|show|counters|clients|split|lan}"
 		exit 1
 		;;
 esac

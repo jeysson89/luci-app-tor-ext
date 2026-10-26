@@ -1066,6 +1066,164 @@ function trafficResolve(ip) {
 }
 
 /* ------------------------------------------------------------------ */
+/* split tunneling (поеив lists) — mirroring of the podkop lists        */
+/* ------------------------------------------------------------------ */
+
+const SPLIT_CATALOG = '/usr/share/tor-ext/catalog.json';
+const SPLIT_LIST_DIR = '/etc/tor-ext/lists';
+const SPLIT_STATE = '/tmp/tor-ext';
+
+function splitCountLines(path) {
+	const v = trim(sh(`wc -l < ${shq(path)} 2>/dev/null`));
+	return length(v) ? +v : 0;
+}
+
+function splitCatalog() {
+	const raw = jsonParse(readText(SPLIT_CATALOG));
+	if (!raw || !raw.lists)
+		return [];
+	const out = [];
+	for (let i = 0; i < length(raw.lists); i++) {
+		const e = raw.lists[i];
+		let stamp = stat(`${SPLIT_LIST_DIR}/${trim(e.id ?? '')}.stamp`);
+		push(out, {
+			id: e.id ?? '',
+			kind: e.kind ?? 'domains',
+			title: e.title ?? '',
+			group: e.group ?? '',
+			desc: e.desc ?? '',
+			subnets_of: e.subnets_of ?? '',
+			remote: e.count ?? 0,
+			downloaded: stamp ? true : false,
+			downloaded_at: stamp ? stamp.mtime : 0
+		});
+	}
+	return out;
+}
+
+function splitListValues(enabled, catalog) {
+	/* turn each entry of the catalog into an object with enabled flag */
+	const out = [];
+	for (let i = 0; i < length(catalog); i++) {
+		const e = catalog[i];
+		push(out, {
+			id: e.id,
+			enabled: inList(enabled, e.id),
+			remote: e.remote,
+			downloaded: e.downloaded,
+			downloaded_at: e.downloaded_at
+		});
+	}
+	return out;
+}
+
+function splitFileStat(name) {
+	const path = `${SPLIT_STATE}/${name}`;
+	if (!exists(path))
+		return { lines: 0, stamp: 0 };
+	return {
+		lines: splitCountLines(path),
+		stamp: stat(path)?.mtime ?? 0
+	};
+}
+
+function splitState() {
+	const enabledLists = uciShowList('split.lists');
+	const catalog = splitCatalog();
+
+	const domains = splitFileStat('split-domains.lst');
+	const subnets = splitFileStat('split-subnets.lst');
+	const resolved = splitFileStat('split-resolved.lst');
+	const resolvedStamp = stat(`${SPLIT_STATE}/split-resolved.stamp`);
+
+	const dnsconfDir = trim(sh("cat /var/etc/dnsmasq.conf.* 2>/dev/null | grep -m1 '^conf-dir=' | cut -d= -f2"));
+	const dnsconf = dnsconfDir ? exists(`${dnsconfDir}/tor-ext-split.conf`) : false;
+	const table = !!length(trim(sh("nft list tables 2>/dev/null | grep tor_ext")));
+	const resolving = exists(`${SPLIT_STATE}/resolve.pid`);
+
+	return {
+		ok: true,
+		enabled: uciGet('split.enabled', '0') == '1',
+		mode: uciGet('split.mode', 'proxy'),
+		scope: uciGet('split.scope', 'clients'),
+		block_quic: uciGet('split.block_quic', '1') == '1',
+		block_dot: uciGet('split.block_dot', '1') == '1',
+		interval: uciGet('split.interval', '6h'),
+		clients: uciShowList('split.client'),
+		lists: enabledLists,
+		custom_domains: uciShowList('split.custom_domains'),
+		custom_subnets: uciShowList('split.custom_subnets'),
+		catalog: splitListValues(enabledLists, catalog),
+		catalog_source: (() => {
+			const raw = jsonParse(readText(SPLIT_CATALOG));
+			return raw ? (raw.source_url ?? '') : '';
+		})(),
+		counts: {
+			domains: domains.lines,
+			subnets: subnets.lines,
+			resolved: resolved.lines,
+			resolved_at: resolvedStamp ? resolvedStamp.mtime : 0
+		},
+		dnsmasq_conf: dnsconf,
+		nft_table: table,
+		resolving
+	};
+}
+
+function splitValidDomain(d) {
+	return !!trim(d) && match(trim(d), /^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/);
+}
+
+function splitValidSubnet(s) {
+	return !!trim(s) && match(trim(s), /^([0-9]{1,3}\.){3}[0-9]{1,3}(\/([0-9]|[12][0-9]|3[0-2]))?$/);
+}
+
+function splitSaveArgs(args) {
+	const clients = [];
+	const lists = args.lists ?? [];
+	const domains = args.custom_domains ?? [];
+	const subnets = args.custom_subnets ?? [];
+
+	for (let i = 0; i < length(args.clients ?? []); i++) {
+		const c = trim(args.clients[i]);
+		if (match(c, /^[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]{1,2})?$/))
+			push(clients, c);
+	}
+
+	const cleanLists = [];
+	for (let i = 0; i < length(lists); i++)
+		if (trim(lists[i]))
+			push(cleanLists, trim(lists[i]));
+
+	const cleanDomains = [];
+	for (let i = 0; i < length(domains); i++) {
+		const d = trim(domains[i]);
+		if (splitValidDomain(d))
+			push(cleanDomains, lc(d));
+	}
+
+	const cleanSubnets = [];
+	for (let i = 0; i < length(subnets); i++) {
+		const s = trim(subnets[i]);
+		if (splitValidSubnet(s))
+			push(cleanSubnets, s);
+	}
+
+	uciApply([
+		['split', 'enabled', args.enabled ? '1' : '0'],
+		['split', 'mode', (args.mode == 'direct') ? 'direct' : 'proxy'],
+		['split', 'scope', (args.scope == 'all') ? 'all' : 'clients'],
+		['split', 'block_quic', args.block_quic !== false ? '1' : '0'],
+		['split', 'block_dot', args.block_dot !== false ? '1' : '0'],
+		['split', 'interval', ['1h', '6h', '12h', '24h'].indexOf(trim(args.interval ?? '6h')) >= 0 ? trim(args.interval) : '6h'],
+		['split', 'client', length(clients) ? clients : null],
+		['split', 'lists', length(cleanLists) ? cleanLists : null],
+		['split', 'custom_domains', length(cleanDomains) ? cleanDomains : null],
+		['split', 'custom_subnets', length(cleanSubnets) ? cleanSubnets : null]
+	]);
+}
+
+/* ------------------------------------------------------------------ */
 /* public RPC methods                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1515,6 +1673,75 @@ const methods = {
 				message: state.enabled ? 'Прозрачное проксирование включено.' : 'Прозрачное проксирование выключено.',
 				state
 			};
+		}
+	},
+
+	splitGet: {
+		call: function() {
+			return splitState();
+		}
+	},
+
+	splitSave: {
+		args: {
+			enabled: false, mode: 'proxy', scope: 'clients',
+			clients: [], lists: [],
+			custom_domains: [], custom_subnets: [],
+			block_quic: true, block_dot: true,
+			interval: '6h'
+		},
+		call: function(req) {
+			const a = req.args ?? {};
+			if (a.enabled) {
+				let hasList = false;
+				for (let i = 0; i < length(a.lists ?? []); i++)
+					if (trim(a.lists[i])) { hasList = true; break; }
+				hasList = hasList || length(a.custom_domains ?? []) || length(a.custom_subnets ?? []);
+				if (!hasList)
+					return { ok: false, message: 'Включите хотя бы один список или добавьте свои домены/подсети.' };
+				if ((a.scope ?? 'clients') == 'clients' && !length(a.clients ?? []))
+					return { ok: false, message: 'Для режима "выбранные устройства" укажите IP клиентов.' };
+			}
+
+			splitSaveArgs(a);
+			if (a.enabled) {
+				/* fetch the list files first (once they enabled), then merge+dnsconf+fill */
+				sh('/usr/libexec/tor-ext/lists fetch-all >/dev/null 2>&1');
+				sh('/usr/libexec/tor-ext/lists apply 2>&1');
+				sh('/usr/libexec/tor-ext/lists resolve-bg >/dev/null 2>&1');
+			}
+			else {
+				sh('/usr/libexec/tor-ext/lists apply 2>&1');
+			}
+
+			const ok = trim(sh('/usr/libexec/tor-ext/apply-proxy apply 2>&1; echo rc=$?'));
+			const rc = (match(ok, /rc=([0-9]+)/) ?? [])[1];
+			const state = splitState();
+			if (rc != '0')
+				return { ok: false, message: 'Правила nftables не применились, проверьте системный лог.', state };
+			return {
+				ok: true,
+				message: state.enabled
+					? 'Раздельное туннелирование включено (IP-адреса списков уточняются в фоне).'
+					: 'Раздельное туннелирование выключено.',
+				state
+			};
+		}
+	},
+
+	/* download fresh list files into /etc/tor-ext/lists (runs in background) */
+	splitUpdate: {
+		call: function() {
+			sh('( /usr/libexec/tor-ext/lists fetch-all && /usr/libexec/tor-ext/lists apply && /usr/libexec/tor-ext/lists resolve-bg ) >/dev/null 2>&1 &');
+			return { ok: true, message: 'Обновление списков запущено (проверьте состояние через минуту).' };
+		}
+	},
+
+	/* re-resolve the domains via Tor DNS and refill split_dsts4 */
+	splitResolve: {
+		call: function() {
+			sh('/usr/libexec/tor-ext/lists resolve-bg >/dev/null 2>&1');
+			return { ok: true, message: 'Разрешение запущено в фоне (проверьте количество IP через пару минут).' };
 		}
 	},
 
