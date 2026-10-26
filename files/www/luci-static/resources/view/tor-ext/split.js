@@ -36,17 +36,10 @@ return view.extend({
 		this.enabled = E('input', { 'type': 'checkbox', 'checked': s.enabled ? '' : null, 'change': function(ev) { self.toggle(ev.target.checked); } });
 		this.stateLabel = E('span', {}, s.enabled ? 'Раздельное туннелирование включено' : 'Раздельное туннелирование выключено');
 
-		this.mode = E('select', { 'class': 'cbi-input-select' }, [
-			E('option', { 'value': 'proxy', 'selected': s.mode !== 'direct' ? '' : null }, 'Только адреса из списков — через Tor'),
-			E('option', { 'value': 'direct', 'selected': s.mode === 'direct' ? '' : null }, 'Из списков — напрямую (исключения из полного туннеля)')
-		]);
-
-		this.scope = E('select', { 'class': 'cbi-input-select' }, [
+		this.scope = E('select', { 'class': 'cbi-input-select', 'change': function() { self.renderDeviceList(); } }, [
 			E('option', { 'value': 'clients', 'selected': s.scope !== 'all' ? '' : null }, 'Только выбранные устройства'),
 			E('option', { 'value': 'all', 'selected': s.scope === 'all' ? '' : null }, 'Все устройства LAN')
 		]);
-
-		this.clients = E('textarea', { 'class': 'tx-code', 'rows': 5, 'spellcheck': 'false', 'placeholder': '192.168.1.100\n192.168.1.101', 'style': 'min-height:120px' }, (s.clients || []).join('\n'));
 
 		this.interval = E('select', { 'class': 'cbi-input-select' }, INTERV.map(function(o) {
 			return E('option', { 'value': o[0], 'selected': s.interval === o[0] ? '' : null }, o[1]);
@@ -61,62 +54,57 @@ return view.extend({
 		this.customDomains = E('textarea', { 'class': 'tx-code', 'rows': 4, 'spellcheck': 'false', 'placeholder': 'example.com\nsecond.example.org', 'style': 'min-height:96px' }, (s.custom_domains || []).join('\n'));
 		this.customSubnets = E('textarea', { 'class': 'tx-code', 'rows': 4, 'spellcheck': 'false', 'placeholder': '103.21.244.0/22\n52.5.0.0/16', 'style': 'min-height:96px' }, (s.custom_subnets || []).join('\n'));
 
-		this.listBox = E('div', {}, this.renderLists(s, leases));
+		this.listBox = E('div', {}, this.renderLists(s));
 		this.counterBox = E('div', { 'id': 'tx-split-counters' }, this.renderCounters(s));
-		this.leaseBox = E('div', { 'class': 'tx-grid' }, leases.length ? leases.slice(0, 40).map(function(l) {
-			var ip = l.ipaddr || l.ip || '';
-			return E('div', { 'class': 'tx-row', 'style': 'margin:0;gap:6px;justify-content:space-between' }, [
-				E('span', {}, [E('b', {}, ip || '?'), E('span', { 'class': 'tx-muted' }, ' ' + (l.hostname || ''))]),
-				TX.btn('Добавить', 'action', function() {
-					var v = self.clients.value.split('\n').map(function(x) { return x.trim(); }).filter(function(x) { return x.length; });
-					if (ip && v.indexOf(ip) < 0) v.push(ip);
-					self.clients.value = v.join('\n');
-				})
-			]);
-		}) : E('p', { 'class': 'tx-muted' }, 'Аренды DHCP не найдены.'));
+
+		/* devices: checkbox selection from DHCP leases + manual additions */
+		this.leases = leases;
+		this.manualClients = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '192.168.1.100', 'style': 'width:180px' });
+		this.deviceBox = E('div', {});
+		this.manualBox = E('div', { 'class': 'tx-muted', 'style': 'margin-top:6px' });
 
 		var page = E('div', { 'class': 'tx-page' }, [
 			TX.style(),
 			E('h2', {}, 'Раздельное туннелирование'),
 			E('div', { 'class': 'tx-muted' },
-				'Трафик только для выбранных доменов и подсетей. Списки — зеркало itdoginfo/allow-domains (используются podkop), файлы хранятся в репозитории приложения. Домены списков резолвятся через Tor, их IP-адреса заворачиваются в TransPort через nftables.'),
+				'Трафик выбранных доменов и подсетей идёт через Tor, остальное — напрямую. ' +
+				'Списки — зеркало itdoginfo/allow-domains (те же, что использует podkop); домены списков резолвятся через Tor, их IP-адреса заворачиваются в Tor правилами nftables.'),
 
 			TX.card('Состояние', [
 				E('div', { 'class': 'tx-row', 'style': 'justify-content:space-between' }, [
-					E('label', { 'class': 'tx-check', 'style': 'margin:0;font-weight:bold' }, [this.enabled, this.stateLabel]),
+					E('label', { 'style': 'margin:0;font-weight:bold' }, [this.enabled, this.stateLabel]),
 					this.counterBox
 				]),
-				E('div', { 'class': 'tx-muted' }, s.dnsmasq_conf ? 'DNS списков обслуживается dnsmasq' : 'DNS списков отключён', E('span', {}, ' · '), 'nftables: ', s.nft_table ? 'таблица загружена' : 'таблица отсутствует', s.resolving ? ' · идёт разрешение доменов…' : '')
-			]),
-
-			TX.card('Как заворачивать трафик', [
-				E('div', { 'class': 'tx-row' }, [E('label', {}, 'Режим'), this.mode]),
 				E('div', { 'class': 'tx-muted' },
-					'«Через Tor» — сайты из списков идут через Tor, остальное напрямую (работает и без полного проксирования). ' +
-					'«Напрямую» — полный туннель из раздела «Проксирование» не касается адресов из списков (российские банки, почта и т.п. идут напрямую).')
+					'DNS списков: ', s.dnsmasq_conf ? 'обслуживается dnsmasq' : 'отключён',
+					' · nftables: ', s.nft_table ? 'таблица загружена' : 'таблица отсутствует',
+					s.resolving ? ' · идёт разрешение доменов…' : '')
 			]),
 
 			TX.card('Устройства', [
 				E('div', { 'class': 'tx-row' }, [E('label', {}, 'Кому применять'), this.scope]),
-				E('div', { 'class': 'tx-muted' }, 'IP-адреса или подсети, по одному в строке. Для режима «напрямую» устройства настраиваются в разделе «Проксирование».'),
-				this.clients,
-				E('details', {}, [
-					E('summary', { 'class': 'tx-muted' }, 'Выбрать из аренд DHCP'),
-					this.leaseBox
-				])
+				this.deviceBox,
+				E('div', { 'class': 'tx-row', 'style': 'margin-top:8px' }, [
+					E('label', { 'class': 'tx-muted', 'style': 'margin:0' }, 'Добавить вручную:'),
+					this.manualClients,
+					TX.btn('Добавить', 'action', function() { return self.addManual(); })
+				]),
+				this.manualBox
 			]),
 
 			TX.card('Списки', [this.listBox]),
 			TX.card('Свои цели', [
-				E('div', { 'class': 'tx-row' }, [
-					E('div', { 'style': 'flex:1;min-width:260px' }, [E('b', {}, 'Домены'), this.customDomains]),
-					E('div', { 'style': 'flex:1;min-width:260px' }, [E('b', {}, 'Подсети / IP'), this.customSubnets])
+				E('div', { 'class': 'tx-row', 'style': 'align-items:flex-start' }, [
+					E('div', { 'style': 'flex:1;min-width:260px' }, [E('b', {}, 'Домены'), E('br'), this.customDomains]),
+					E('div', { 'style': 'flex:1;min-width:260px' }, [E('b', {}, 'Подсети / IP'), E('br'), this.customSubnets])
 				])
 			]),
 
-			TX.card('Обновление', [
-				E('div', { 'class': 'tx-row' }, [E('label', {}, 'Автообновление'), this.interval]),
-				E('div', { 'class': 'tx-row' }, [
+			TX.card('Обновление и параметры', [
+				E('div', { 'class': 'tx-row' }, [E('label', {}, 'Автообновление списков'), this.interval]),
+				E('label', { 'class': 'tx-check' }, [this.opt.block_quic, 'Блокировать QUIC (UDP 443) к сайтам из списков']),
+				E('label', { 'class': 'tx-check' }, [this.opt.block_dot, 'Блокировать DNS-over-TLS (853)']),
+				E('div', { 'class': 'tx-row', 'style': 'margin-top:10px' }, [
 					TX.btn('Применить', 'action important', function() { return self.save(); }),
 					TX.btn('Обновить списки с GitHub', 'action', function() { return self.update(); }),
 					TX.btn('Разрешить домены сейчас', 'action', function() { return self.resolve(); })
@@ -126,6 +114,7 @@ return view.extend({
 		]);
 
 		this.toggle(s.enabled);
+		this.renderDeviceList();
 		return page;
 	},
 
@@ -140,17 +129,17 @@ return view.extend({
 
 	renderLists: function(s) {
 		var self = this;
-		var groups = {};
-		var order = [];
+		var groups = {}, order = [];
 		var cat = s.catalog || [];
 
 		for (var i = 0; i < cat.length; i++) {
 			var e = cat[i];
-			if (!groups[e.group]) {
-				groups[e.group] = [];
-				order.push(e.group);
+			var g = e.group || 'Прочее';
+			if (!groups[g]) {
+				groups[g] = [];
+				order.push(g);
 			}
-			groups[e.group].push(e);
+			groups[g].push(e);
 		}
 		if (!order.length)
 			return [E('p', { 'class': 'tx-muted' }, 'Каталог списков недоступен.')];
@@ -158,39 +147,124 @@ return view.extend({
 		var boxes = {};
 		this.listBoxes = boxes;
 
-		order.sort(function(a, b) {
-			var w = { 'Россия': 0, 'Сервисы': 1, 'Категории': 2, 'Подсети': 3 };
-			return (w[a] ?? 9) - (w[b] ?? 9);
-		});
+		var weight = { 'Россия': 0, 'Сервисы': 1, 'Категории': 2, 'Подсети': 3 };
+		order.sort(function(a, b) { return (weight[a] != null ? weight[a] : 9) - (weight[b] != null ? weight[b] : 9); });
 
 		var out = [];
-		for (var g = 0; g < order.length; g++) {
-			var name = order[g];
-			out.push(E('div', { 'class': 'tx-muted', 'style': 'margin-top:8px;font-weight:bold' }, name));
+		for (var gi = 0; gi < order.length; gi++) {
+			var name = order[gi];
+			out.push(E('div', { 'style': 'margin-top:10px;font-weight:bold' }, name));
 			for (var k = 0; k < groups[name].length; k++) {
-				var e = groups[name][k];
+				var it = groups[name][k];
 				var meta = [];
-				if (e.subnets_of) meta.push('включая подсети');
-				if (e.downloaded) meta.push('файл от ' + TX.fmtTime(e.downloaded_at));
+				if (it.subnets_of) meta.push('включая подсети');
+				if (it.downloaded) meta.push('скачан ' + TX.fmtTime(it.downloaded_at));
 				else meta.push('не скачан');
-				var cb = E('input', { 'type': 'checkbox', 'checked': e.enabled ? '' : null, 'data-id': e.id });
-				boxes[e.id] = cb;
-				out.push(E('label', { 'class': 'tx-check' }, [
+				var cb = E('input', { 'type': 'checkbox', 'checked': it.enabled ? '' : null, 'data-id': it.id });
+				boxes[it.id] = cb;
+				out.push(E('label', { 'class': 'tx-check', 'style': 'display:flex;margin:4px 0;align-items:flex-start' }, [
 					cb,
-					E('span', {}, [E('b', {}, e.title), E('span', { 'class': 'tx-muted' }, '  (' + e.remote + ') · ' + meta.join(', '))])
+					E('span', {}, [
+						E('b', {}, it.title || it.id),
+						E('span', { 'class': 'tx-muted' }, '  (' + (it.remote || 0) + ') · ' + meta.join(', ')),
+						it.desc ? E('div', { 'class': 'tx-muted', 'style': 'font-weight:normal' }, it.desc) : ''
+					])
 				]));
-				if (e.desc)
-					out.push(E('div', { 'class': 'tx-muted', 'style': 'margin-left:24px;margin-top:-2px' }, e.desc));
 			}
 		}
 		return out;
 	},
 
+	renderDeviceList: function() {
+		var self = this;
+		var all = this.scope.value === 'all';
+		var selected = (this.state ? (this.state.clients || []) : []).slice();
+		/* keep manually added entries that are not in leases */
+		var leaseIPs = {};
+		(this.leases || []).forEach(function(l) { leaseIPs[self.leaseIP(l)] = self.leaseIP(l); });
+		this.extraClients = (selected || []).filter(function(ip) {
+			return !leaseIPs[ip];
+		});
+
+		dom.content(this.deviceBox, all ? [
+			E('div', { 'class': 'tx-muted' }, 'Правила применяются ко всем устройствам LAN.')
+		] : [
+			E('div', { 'class': 'tx-muted', 'style': 'margin-bottom:6px' }, 'Отметьте устройства из аренд DHCP:'),
+			(this.leases && this.leases.length) ?
+				E('div', {}, this.leases.slice(0, 60).map(function(l) {
+					return self.deviceRow(l);
+				}))
+				: E('div', { 'class': 'tx-muted' }, 'Аренды DHCP не найдены — добавьте IP вручную.')
+		]);
+
+		this.renderManual();
+	},
+
+	leaseIP: function(l) {
+		return l.ipaddr || l.ip || '';
+	},
+
+	deviceRow: function(l) {
+		var self = this;
+		var ip = this.leaseIP(l);
+		var host = l.hostname || l.macaddr || '';
+		var cb = E('input', { 'type': 'checkbox', 'checked': this.isSelected(ip) ? '' : null });
+		cb.addEventListener('change', function() { self.toggleDevice(ip, cb.checked); });
+		return E('label', { 'class': 'tx-check', 'style': 'display:flex;margin:2px 0' }, [
+			cb,
+			E('span', {}, [E('b', {}, ip), host ? E('span', { 'class': 'tx-muted' }, '  ' + host) : ''])
+		]);
+	},
+
+	isSelected: function(ip) {
+		return (this.state && (this.state.clients || []).indexOf(ip) >= 0);
+	},
+
+	toggleDevice: function(ip, on) {
+		var cur = (this.state && this.state.clients) ? this.state.clients.slice() : [];
+		var pos = cur.indexOf(ip);
+		if (on && pos < 0) cur.push(ip);
+		if (!on && pos >= 0) cur.splice(pos, 1);
+		this.state.clients = cur;
+		this.renderManual();
+	},
+
+	addManual: function() {
+		var ip = String(this.manualClients.value || '').trim();
+		if (!ip) return;
+		if (!/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/.test(ip)) {
+			TX.notify('Неверный IP или подсеть: ' + ip, 'danger');
+			return;
+		}
+		var cur = (this.state && this.state.clients) ? this.state.clients.slice() : [];
+		if (cur.indexOf(ip) < 0) cur.push(ip);
+		this.state.clients = cur;
+		this.manualClients.value = '';
+		this.renderManual();
+	},
+
+	renderManual: function() {
+		var self = this;
+		var leaseIPs = {};
+		(this.leases || []).forEach(function(l) { leaseIPs[self.leaseIP(l)] = true; });
+		var extra = ((this.state && this.state.clients) || []).filter(function(ip) { return !leaseIPs[ip]; });
+		dom.content(this.manualBox, extra.length ? [
+			'Вручную добавлены: ',
+			extra.map(function(ip, idx) {
+				var del = E('a', { 'href': '#', 'style': 'margin-left:4px;color:#c62828' }, '×');
+				del.addEventListener('click', function(ev) {
+					ev.preventDefault();
+					self.toggleDevice(ip, false);
+				});
+				return E('span', {}, [E('b', {}, ip), del, idx < extra.length - 1 ? E('span', { 'class': 'tx-muted' }, ', ') : '']);
+			})
+		] : [ 'Выбранные устройства: ' + (((this.state && this.state.clients) || []).length) ]);
+	},
+
 	toggle: function(on) {
-		this.clients.disabled = !on;
-		this.clients.style.opacity = on ? 1 : 0.5;
 		for (var id in (this.listBoxes || {}))
 			this.listBoxes[id].disabled = !on;
+		this.scope.disabled = !on;
 		if (this.stateLabel)
 			this.stateLabel.textContent = on ? 'Раздельное туннелирование включено' : 'Раздельное туннелирование выключено';
 	},
@@ -202,9 +276,9 @@ return view.extend({
 				lists.push(id);
 		return {
 			enabled: this.enabled.checked,
-			mode: this.mode.value,
+			mode: 'proxy',
 			scope: this.scope.value,
-			clients: this.clients.value.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length; }),
+			clients: (this.state && this.state.clients) || [],
 			lists: lists,
 			custom_domains: this.customDomains.value.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length; }),
 			custom_subnets: this.customSubnets.value.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length; }),
@@ -222,6 +296,7 @@ return view.extend({
 			if (res.state) {
 				self.state = res.state;
 				dom.content(self.counterBox, self.renderCounters(res.state));
+				self.renderDeviceList();
 			}
 		}).catch(TX.rpcError);
 	},

@@ -138,7 +138,7 @@ build_rules() {
 			echo "		ip saddr @split_clients ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return"
 			echo "		ip saddr @split_clients tcp dport { $trans_port, $dns_port, $socks_port, 9051 } return"
 			[ "$split_dot" = "1" ] && echo "		ip saddr @split_clients tcp dport 853 reject"
-			echo "		ip saddr @split_clients ip daddr @split_dsts4 meta l4proto tcp redirect to :$trans_port counter"
+			echo "		ip saddr @split_clients ip daddr @split_dsts4 meta l4proto tcp counter redirect to :$trans_port"
 		fi
 		if [ -n "$clients" ]; then
 			# The DNS redirect must be placed before the "private networks"

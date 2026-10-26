@@ -1108,6 +1108,11 @@ function splitListValues(enabled, catalog) {
 		const e = catalog[i];
 		push(out, {
 			id: e.id,
+			kind: e.kind,
+			title: e.title,
+			group: e.group,
+			desc: e.desc,
+			subnets_of: e.subnets_of,
 			enabled: inList(enabled, e.id),
 			remote: e.remote,
 			downloaded: e.downloaded,

@@ -64,22 +64,9 @@
 			]
 		}
 	},
-	"admin/services/tor-ext/proxy": {
-		"title": "Проксирование",
-		"order": 50,
-		"action": {
-			"type": "view",
-			"path": "tor-ext/proxy"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-tor-ext"
-			]
-		}
-	},
 	"admin/services/tor-ext/split": {
 		"title": "Раздельное туннелирование",
-		"order": 55,
+		"order": 50,
 		"action": {
 			"type": "view",
 			"path": "tor-ext/split"

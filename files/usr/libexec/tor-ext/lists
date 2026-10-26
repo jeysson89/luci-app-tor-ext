@@ -53,19 +53,25 @@ norm_domain() {
 	case "$d" in
 		''|"#"*|"//"*) return ;;
 		*://*) d=${d#*://}; d=${d%%/*} ;;
-	 esac
+	esac
 	case "$d" in
 		*[!A-Za-z0-9.-]*) return ;;
+	esac
+	# strip a leading "*." and leading dots, then trailing dots
+	while :; do
+		case "$d" in
+			'*.'*) d=${d#*.} ;;
+			.*) d=${d#.} ;;
+			*) break ;;
 		esac
-	while [ "$d" != "${d#*.}" ]; do d=${d#*.}; done
-	case "$d" in
-		'*'*) return ;;
- esac
+	done
 	while [ "$d" != "${d%.}" ]; do d=${d%.}; done
 	case "$d" in
-		''|.[.]*) return ;;
- esac
-	printf '%s' "$d" | grep -qE '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.){1,}[A-Za-z]{2,}$' || return
+		''|*'*'*) return ;;
+	esac
+	# a dot and valid labels are required
+	printf '%s' "$d" | grep -q '\.' || return
+	printf '%s' "$d" | grep -qE '^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z]$' || return
 	printf '%s\n' "$d"
 }
 
@@ -75,10 +81,10 @@ norm_subnet() {
 	case "$s" in
 		''|"#"*|"//"*) return ;;
 		*[!0-9./]*) return ;;
- esac
+	esac
 	case "$s" in
-		.|"."|.*|*.) return ;;
- esac
+		.|"."*|*.|*.) return ;;
+	esac
 	printf '%s' "$s" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$' || return
 	printf '%s\n' "$s"
 }
