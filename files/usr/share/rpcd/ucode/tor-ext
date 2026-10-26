@@ -1220,7 +1220,7 @@ function splitSaveArgs(args) {
 		['split', 'scope', (args.scope == 'all') ? 'all' : 'clients'],
 		['split', 'block_quic', args.block_quic !== false ? '1' : '0'],
 		['split', 'block_dot', args.block_dot !== false ? '1' : '0'],
-		['split', 'interval', ['1h', '6h', '12h', '24h'].indexOf(trim(args.interval ?? '6h')) >= 0 ? trim(args.interval) : '6h'],
+		['split', 'interval', index(['1h', '6h', '12h', '24h'], trim(args.interval ?? '6h')) >= 0 ? trim(args.interval) : '6h'],
 		['split', 'client', length(clients) ? clients : null],
 		['split', 'lists', length(cleanLists) ? cleanLists : null],
 		['split', 'custom_domains', length(cleanDomains) ? cleanDomains : null],
