@@ -93,10 +93,13 @@ norm_subnet() {
 # download the list files into /etc/tor-ext/lists/; first via Tor (socks5),
 # then directly; on failure the previous copy is kept.
 do_fetch() {
-	local socksp tmp="$STATE_DIR/list.dl" id line file anyok=""
+	local socksp tmp="$STATE_DIR/list.dl" id anyok=""
 	socksp=$(socks_port)
 
+	# one curl per list, in parallel background jobs
+	local jobs=0
 	for id in "$@"; do
+		local line
 		line=$(tab_lookup "$id")
 		if [ -z "$line" ]; then
 			log "unknown list id '$id'"
@@ -107,22 +110,35 @@ do_fetch() {
 			anyok="$anyok$id"
 			continue
 		fi
-		log "downloading $id"
+		local file
 		file=$(printf '%s' "$line" | cut -d@ -f2)
-
-		if curl -s -m 90 --socks5-hostname "127.0.0.1:$socksp" -o "$tmp" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$tmp" ]; then
-			anyok=1
-		elif curl -s -m 90 -o "$tmp" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$tmp" ]; then
-			anyok=1
-		fi
-
-		if [ -s "$tmp" ] && head -c 1 "$tmp" | grep -q '<'; then
-			:	# looks like an error page
-		else
-			mv "$tmp" "$LISTS_DIR/$id.lst" 2>/dev/null && date +%s > "$LISTS_DIR/$id.stamp"
-		fi
-		rm -f "$tmp"
+		log "downloading $id"
+		(
+			t="$tmp.$id"
+			if curl -s -m 90 --socks5-hostname "127.0.0.1:$socksp" -o "$t" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$t" ]; then
+				:
+			elif curl -s -m 90 -o "$t" "$REMOTE_BASE/$file" 2>/dev/null && [ -s "$t" ]; then
+				:
+			else
+				rm -f "$t"
+				exit 1
+			fi
+			# error pages start with '<' - skip them
+			if head -c 1 "$t" | grep -q '<'; then
+				rm -f "$t"
+				exit 1
+			fi
+			mv "$t" "$LISTS_DIR/$id.lst" 2>/dev/null && date +%s > "$LISTS_DIR/$id.stamp"
+		) >/dev/null 2>&1 &
+		jobs=$((jobs + 1))
 	done
+
+	if [ "$jobs" != "0" ]; then
+		wait
+		for id in "$@"; do
+			[ -f "$LISTS_DIR/$id.stamp" ] && anyok="$anyok$id"
+		done
+	fi
 
 	if [ -z "$anyok" ]; then
 		log "fetch: nothing downloaded"
@@ -253,7 +269,9 @@ do_dnsconf() {
 	cp "$STATE_DIR/.dnsconf" "$conf"
 	rm -f "$STATE_DIR/.dnsconf"
 
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	# reload dnsmasq asynchronously: the restart takes seconds and should not
+	# block the RPC call
+	( /etc/init.d/dnsmasq restart >/dev/null 2>&1 ) >/dev/null 2>&1 &
 	log "dnsmasq updated: $nds domains go through Tor DNS"
 	return 0
 }
